@@ -1,6 +1,19 @@
-import os, glob, math, argparse, sys
+import os, glob, math, argparse, sys, traceback
 import numpy as np
 import soundfile as sf
+
+# =======================
+# PyInstaller/--windowed safety:
+# evita crash de argparse cuando sys.stderr/sys.stdout son None
+# =======================
+if getattr(sys, "frozen", False):
+    try:
+        if sys.stdout is None:
+            sys.stdout = open(os.devnull, "w")
+        if sys.stderr is None:
+            sys.stderr = open(os.devnull, "w")
+    except Exception:
+        pass
 
 # =======================
 # WAVETABLE CORE (offline)
@@ -85,15 +98,18 @@ def build_wavetable_mipmaps(frames: np.ndarray, levels: int = WT_MIP_LEVELS):
 def _lerp(a, b, t):
     return a + (b - a) * t
 
+def _table_read_linear(table_1d: np.ndarray, phase: np.ndarray) -> np.ndarray:
+    n = len(table_1d)
+    idx = phase * n
+    i0 = np.floor(idx).astype(np.int32)
+    frac = idx - i0
+    i1 = (i0 + 1) % n
+    return (1.0 - frac) * table_1d[i0] + frac * table_1d[i1]
+
 # ==========================================================
-# (1) Interpolación mejor: Cubic/Hermite (Catmull-Rom) 4 puntos
+# Interpolación mejor: Cubic/Hermite (Catmull-Rom) 4 puntos
 # ==========================================================
 def _table_read_cubic_hermite(table_1d: np.ndarray, phase: np.ndarray) -> np.ndarray:
-    """
-    Catmull-Rom cubic (Hermite-like) 4-point interpolation.
-    phase: 0..1 (vector)
-    table_1d: 1D wavetable (circular)
-    """
     n = len(table_1d)
     idx = phase * n
     i1 = np.floor(idx).astype(np.int32)
@@ -116,8 +132,7 @@ def _table_read_cubic_hermite(table_1d: np.ndarray, phase: np.ndarray) -> np.nda
     return (((a * t + b) * t + c) * t + d).astype(np.float32, copy=False)
 
 # ==========================================================
-# (2) Anti-aliasing mejor: derivative mip (por inc) + smoothing
-# (3) Optimización: mip-blend por bloques
+# Derivative mip + smoothing + mip por bloques
 # ==========================================================
 def render_wavetable_osc_f0_array(
     f0_hz: np.ndarray,
@@ -143,7 +158,6 @@ def render_wavetable_osc_f0_array(
     ft = float(fidx - f0i)
     f1i = min(f0i + 1, n_frames - 1)
 
-    # phase vectorizada
     inc = (f0_hz / float(sr)).astype(np.float32)  # cycles/sample
     c = np.cumsum(inc, dtype=np.float64)
     phase = (float(phase0) + np.concatenate(([0.0], c[:-1].astype(np.float32)))) % 1.0
@@ -231,25 +245,6 @@ def list_wav_files(folder: str):
 def safe_name(s: str) -> str:
     return s.replace("#","s").replace("-","m")
 
-# ==========================================
-# Velocities perceptuales
-# ==========================================
-def velocity_bins_perceptual(n_layers: int, curve: float = 2.2):
-    x = np.linspace(0.0, 1.0, n_layers + 1)
-    edges = 1.0 + 127.0 * (x ** curve)
-    bins = []
-    prev = 0
-    for i in range(n_layers):
-        lo = int(math.floor(edges[i]))
-        hi = int(math.floor(edges[i+1] - 1e-9))
-        lo = max(lo, prev + 1)
-        hi = max(hi, lo)
-        if i == n_layers - 1:
-            hi = 127
-        bins.append((lo, hi))
-        prev = hi
-    return bins
-
 def db_to_lin(db: float) -> float:
     return float(10.0 ** (db / 20.0))
 
@@ -289,7 +284,7 @@ def hash_float01(a: int) -> float:
     return x / 0x7fffffff
 
 # ==========================================
-# ADSR helpers (sustain-only + release-only)
+# ADSR helpers
 # ==========================================
 def adsr_sustain_env(n: int, sr: int, v: float) -> np.ndarray:
     v = float(np.clip(v, 0.0, 1.0))
@@ -413,7 +408,6 @@ def synth_sustain_one_shot(
 
     knee = 0.71
     knee_part = float(np.clip((v - knee) / max(1e-6, (1.0 - knee)), 0.0, 1.0))
-
     v_curve = v ** 1.45
     amp_db = np.interp(v_curve, [0.0, 0.75, 1.0], [-34.0, -12.5, -9.5])
     amp_db -= 1.5 * knee_part
@@ -431,6 +425,7 @@ def synth_sustain_one_shot(
     cents_total = (pitch_env + vibrato).astype(np.float32)
     f0 = (f0_base * (2.0 ** (cents_total / 1200.0))).astype(np.float32)
 
+    # detune por oscilador
     h = stable_hash32(f"{note_name}|{vel_index}|RR{rr_index}|{int(kt*1000)}|{int(v*10000)}")
     base_det = (hash_float01(h) * 2.0 - 1.0)
 
@@ -492,6 +487,7 @@ def synth_sustain_one_shot(
     w_mid_t  = np.clip(w_mid  + 0.10 * fenv, 0.0, 0.9).astype(np.float32)
     w_low_t  = np.clip(w_low  - 0.12 * fenv, 0.0, 0.9).astype(np.float32)
 
+    # micro movimiento
     h2 = stable_hash32(f"{note_name}|{vel_index}|RR{rr_index}|LFO")
     rate = np.interp(hash_float01(h2), [0,1], [0.18, 0.55])
     phase_lfo = 2.0 * np.pi * hash_float01(h2 ^ 0xA5A5A5A5)
@@ -506,6 +502,7 @@ def synth_sustain_one_shot(
 
     y = (w_low_t*y0 + w_mid_t*y1 + w_high_t*y2).astype(np.float32, copy=False)
 
+    # transients
     noise = rng_noise.standard_normal(n).astype(np.float32)
     hp_noise = (noise - np.concatenate(([0.0], noise[:-1]))).astype(np.float32)
     bp_noise = bandpass_noise_keytracked(hp_noise, sr=sr, kt=kt)
@@ -523,8 +520,8 @@ def synth_sustain_one_shot(
         click_env = exp_decay(t[:click_len], tau=np.interp(v, [0,1], [0.0008, 0.0016]))
         click = np.zeros(n, dtype=np.float32)
         click[:click_len] = click_env
-
         click_hp = click - np.concatenate(([0.0], click[:-1]))
+
         k = int(np.clip(np.interp(kt, [0,1], [13, 7]), 5, 21))
         click_lp = np.convolve(click_hp, np.ones(k, dtype=np.float32)/k, mode="same").astype(np.float32)
 
@@ -533,6 +530,7 @@ def synth_sustain_one_shot(
 
     y = (y * env_sus).astype(np.float32, copy=False)
 
+    # drive
     drive_base = np.interp(v, [0,1], [1.10, 2.70])
     drive_base *= (1.05 - 0.25*kt)
     drive_base *= (0.95 + 0.15*kt)
@@ -545,11 +543,13 @@ def synth_sustain_one_shot(
 
     y = cheap_body_eq(y, sr=sr, kt=kt, v=v)
 
+    # RMS staging
     rms = float(np.sqrt(np.mean(y*y) + 1e-12))
     target_rms = db_to_lin(np.interp(v**1.35, [0,1], [-28.0, -10.0]))
     corr = float(np.clip(target_rms / (rms + 1e-12), 0.5, 1.8))
     y = (y * corr).astype(np.float32, copy=False)
 
+    # final
     y = (y * amp * 0.85).astype(np.float32, copy=False)
 
     return np.clip(y, -1.0, 1.0).astype(np.float32, copy=False), phase_end_low, phase_end_mid, phase_end_high
@@ -648,65 +648,61 @@ def synth_release_tail(
     y = np.tanh(drive_env * y).astype(np.float32, copy=False)
 
     y = cheap_body_eq(y, sr=sr, kt=kt, v=v)
-
     return np.clip(y, -1.0, 1.0).astype(np.float32, copy=False)
 
 # =======================
-# MAIN
+# RENDER PIPELINE (para GUI/CLI)
 # =======================
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--wt_dir", default=r"D:\WAVETABLE", help="Carpeta con wavetables .wav (recursivo)")
+def _default_output_dir() -> str:
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.getcwd()
+    return os.path.join(base, "Output")
 
-    # ✅ CAMBIO: out_dir ya NO es required (para EXE --windowed/GUI)
-    ap.add_argument("--out_dir", default=None, help="Carpeta de salida (si None, se auto-elige)")
+def render_instrument(
+    wt_dir: str,
+    out_dir: str | None,
+    seed: int,
+    sr: int,
+    duration: float,
+    release_time: float,
+    loop_start: float,
+    loop_end: float,
+    loop_xfade: float,
+    bitdepth: str,
+    velocity_midi: int,
+    start_oct: int,
+    end_oct: int,
+    mip_block: int,
+    mip_smooth_tau: float,
+    round_robins: int,
+    log_fn=None,
+    progress_fn=None,
+    cancel_check=None,
+):
+    if out_dir is None:
+        out_dir = _default_output_dir()
+    os.makedirs(out_dir, exist_ok=True)
 
-    ap.add_argument("--seed", type=int, default=0, help="0 = random real (elige wavetables/patch distinto), otro = reproducible")
+    def log(s: str):
+        if log_fn:
+            log_fn(s)
+        else:
+            print(s)
 
-    ap.add_argument("--sr", type=int, default=92000)
-    ap.add_argument("--duration", type=float, default=15.0, help="Duración del sample principal (sustain/loop)")
-    ap.add_argument("--release_time", type=float, default=4.0, help="Duración del sample release (0 desactiva)")
+    vel_midi = int(np.clip(velocity_midi, 1, 127))
+    v = float(vel_midi / 127.0)
+    vel_index = 1
 
-    ap.add_argument("--loop_start", type=float, default=1.0)
-    ap.add_argument("--loop_end", type=float, default=4.0)
-    ap.add_argument("--loop_xfade", type=float, default=0.12)
+    rng = np.random.default_rng(None if seed == 0 else seed)
 
-    ap.add_argument("--bitdepth", default="FLOAT", choices=["PCM_16","PCM_24","PCM_32","FLOAT"])
-    ap.add_argument("--vel_layers", type=int, default=25)
-    ap.add_argument("--vel_curve", type=float, default=2.2)
-
-    ap.add_argument("--start_oct", type=int, default=-2)
-    ap.add_argument("--end_oct", type=int, default=8)
-
-    ap.add_argument("--mip_block", type=int, default=256, help="Tamaño de bloque para mip-blend (128-512 típico)")
-    ap.add_argument("--mip_smooth_tau", type=float, default=0.030, help="Tau smoothing para mip-level (segundos)")
-
-    ap.add_argument("--round_robins", type=int, default=3, help="Cantidad de RR por (nota, vel) (1-4 típico)")
-
-    args = ap.parse_args()
-
-    # ✅ CAMBIO: fallback automático si no pasas --out_dir
-    if args.out_dir is None:
-        base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.getcwd()
-        args.out_dir = os.path.join(base, "Output")
-
-    sr = int(args.sr)
-    n_sus = int(sr * float(args.duration))
-    n_rel = int(sr * float(max(0.0, args.release_time)))
-
-    rrN = int(max(1, args.round_robins))
-    rng = np.random.default_rng(None if args.seed == 0 else args.seed)
-
-    wt_files = list_wav_files(args.wt_dir)
+    wt_files = list_wav_files(wt_dir)
     if len(wt_files) < 3:
-        raise RuntimeError(f"Necesitas al menos 3 wavetables .wav en {args.wt_dir}")
+        raise RuntimeError(f"Necesitas al menos 3 wavetables .wav en {wt_dir}")
 
     wt_low, wt_mid, wt_high = rng.choice(wt_files, size=3, replace=False).tolist()
-
-    print("Wavetables fijos para toda la sesión (low/mid/high):")
-    print("  LOW :", os.path.basename(wt_low))
-    print("  MID :", os.path.basename(wt_mid))
-    print("  HIGH:", os.path.basename(wt_high))
+    log("Wavetables fijos para toda la sesión (low/mid/high):")
+    log(f"  LOW : {os.path.basename(wt_low)}")
+    log(f"  MID : {os.path.basename(wt_mid)}")
+    log(f"  HIGH: {os.path.basename(wt_high)}")
 
     mip_low  = build_wavetable_mipmaps(load_wavetable_wav(wt_low),  levels=WT_MIP_LEVELS)
     mip_mid  = build_wavetable_mipmaps(load_wavetable_wav(wt_mid),  levels=WT_MIP_LEVELS)
@@ -716,112 +712,487 @@ def main():
     base_mip   = [float(rng.uniform(0.65, 1.0)) for _ in range(3)]
     base_phase = [float(rng.uniform(0.0, 1.0)) for _ in range(3)]
 
-    vel_bins = velocity_bins_perceptual(int(args.vel_layers), curve=float(args.vel_curve))
+    roots = [f"C{o}" for o in range(int(start_oct), int(end_oct) + 1)]
+    rrN = int(max(1, round_robins))
 
-    roots = [f"C{o}" for o in range(int(args.start_oct), int(args.end_oct) + 1)]
-    total = len(roots) * len(vel_bins) * rrN
+    n_sus = int(int(sr) * float(duration))
+    n_rel = int(int(sr) * float(max(0.0, release_time)))
 
-    samples_dir = os.path.join(args.out_dir, "Samples")
+    samples_dir = os.path.join(out_dir, "Samples")
     os.makedirs(samples_dir, exist_ok=True)
 
-    print(f"Generando {len(roots)} roots x {len(vel_bins)} vel x {rrN} RR = {total} WAVs (+ release si aplica)")
-    print(f"SR={sr}  SUS={args.duration}s  REL={args.release_time}s  BIT={args.bitdepth}")
-    print(f"Loop: start={args.loop_start}s end={args.loop_end}s xfade={args.loop_xfade}s (se aplica al sample principal)")
-    print(f"OUT: {args.out_dir}")
+    bits = _bits_for_subtype(bitdepth)
 
-    kt_den = max(1.0, float(args.end_oct - args.start_oct))
+    kt_den = max(1.0, float(end_oct - start_oct))
 
     session_tag = (
         f"{os.path.basename(wt_low)}|{os.path.basename(wt_mid)}|{os.path.basename(wt_high)}|"
         f"{base_pos[0]:.4f},{base_pos[1]:.4f},{base_pos[2]:.4f}|"
         f"{base_mip[0]:.4f},{base_mip[1]:.4f},{base_mip[2]:.4f}|"
-        f"{base_phase[0]:.4f},{base_phase[1]:.4f},{base_phase[2]:.4f}"
+        f"{base_phase[0]:.4f},{base_phase[1]:.4f},{base_phase[2]:.4f}|VEL{vel_midi}"
     )
 
-    bits = _bits_for_subtype(args.bitdepth)
+    total = len(roots) * rrN * (1 + (1 if n_rel > 0 else 0))
+    done = 0
+
+    log(f"Generando {len(roots)} roots (C{start_oct}..C{end_oct}) x {rrN} RR = {len(roots)*rrN} WAVs (+REL={n_rel>0})")
+    log(f"Velocity fija: {vel_midi} (v={v:.3f}) | SR={sr} | DUR={duration}s | BIT={bitdepth}")
+    log(f"OUT: {out_dir}")
 
     for note in roots:
+        if cancel_check and cancel_check():
+            log("Cancelado por el usuario.")
+            break
+
         f0_base = note_name_to_hz(note)
         note_dir = os.path.join(samples_dir, safe_name(note))
         os.makedirs(note_dir, exist_ok=True)
 
         octv = int(note[1:])
-        kt = float((octv - args.start_oct) / kt_den)
+        kt = float((octv - start_oct) / kt_den)
 
-        for vi, (vlo, vhi) in enumerate(vel_bins, start=1):
-            v_center = 0.5 * (vlo + vhi)
-            v = float(np.clip(v_center / 127.0, 0.0, 1.0))
+        for rri in range(1, rrN + 1):
+            if cancel_check and cancel_check():
+                log("Cancelado por el usuario.")
+                break
 
-            for rri in range(1, rrN + 1):
-                seed_noise = stable_hash32(f"{session_tag}|{note}|{vi}|RR{rri}|noise") & 0x7FFFFFFF
-                rng_noise = np.random.default_rng(int(seed_noise))
+            seed_noise = stable_hash32(f"{session_tag}|{note}|VEL{vel_midi}|RR{rri}|noise") & 0x7FFFFFFF
+            rng_noise = np.random.default_rng(int(seed_noise))
 
-                y, ph_end0, ph_end1, ph_end2 = synth_sustain_one_shot(
+            y, ph_end0, ph_end1, ph_end2 = synth_sustain_one_shot(
+                mip_low, mip_mid, mip_high,
+                f0_base=f0_base,
+                sr=int(sr),
+                n=n_sus,
+                v=v,
+                base_pos=base_pos,
+                base_mip=base_mip,
+                base_phase=base_phase,
+                note_keytrack=kt,
+                note_name=note,
+                vel_index=vel_index,
+                rr_index=rri,
+                rng_noise=rng_noise,
+                mip_block=int(mip_block),
+                mip_smooth_tau=float(mip_smooth_tau),
+            )
+
+            y = apply_loop_crossfade(
+                y, sr=int(sr),
+                loop_start_s=float(loop_start),
+                loop_end_s=float(loop_end),
+                xfade_s=float(loop_xfade),
+            )
+
+            if bits is not None:
+                y = add_tpdf_dither(y, bits=bits, rng=rng_noise)
+
+            fn = f"SYN_{safe_name(note)}_VEL{vel_midi:03d}_RR{rri:02d}.wav"
+            out_path = os.path.join(note_dir, fn)
+            sf.write(out_path, y, int(sr), subtype=bitdepth)
+            log(f"Wrote {out_path}")
+
+            done += 1
+            if progress_fn:
+                progress_fn(done, total)
+
+            if n_rel > 0:
+                if cancel_check and cancel_check():
+                    log("Cancelado por el usuario.")
+                    break
+
+                seed_rel = stable_hash32(f"{session_tag}|{note}|VEL{vel_midi}|RR{rri}|release_noise") & 0x7FFFFFFF
+                rng_rel = np.random.default_rng(int(seed_rel))
+
+                yrel = synth_release_tail(
                     mip_low, mip_mid, mip_high,
                     f0_base=f0_base,
-                    sr=sr,
-                    n=n_sus,
+                    sr=int(sr),
+                    n=n_rel,
                     v=v,
                     base_pos=base_pos,
                     base_mip=base_mip,
-                    base_phase=base_phase,
                     note_keytrack=kt,
                     note_name=note,
-                    vel_index=vi,
+                    vel_index=vel_index,
                     rr_index=rri,
-                    rng_noise=rng_noise,
-                    mip_block=int(args.mip_block),
-                    mip_smooth_tau=float(args.mip_smooth_tau),
-                )
-
-                y = apply_loop_crossfade(
-                    y, sr=sr,
-                    loop_start_s=float(args.loop_start),
-                    loop_end_s=float(args.loop_end),
-                    xfade_s=float(args.loop_xfade),
+                    rng_noise=rng_rel,
+                    phase0_low=ph_end0,
+                    phase0_mid=ph_end1,
+                    phase0_high=ph_end2,
+                    mip_block=int(mip_block),
+                    mip_smooth_tau=float(mip_smooth_tau),
                 )
 
                 if bits is not None:
-                    y = add_tpdf_dither(y, bits=bits, rng=rng_noise)
+                    yrel = add_tpdf_dither(yrel, bits=bits, rng=rng_rel)
 
-                fn = f"SYN_{safe_name(note)}_VEL{vi:02d}_RR{rri:02d}_({vlo:03d}-{vhi:03d}).wav"
-                out_path = os.path.join(note_dir, fn)
-                sf.write(out_path, y, sr, subtype=args.bitdepth)
-                print(f"Wrote {out_path}")
+                fnr = f"SYN_{safe_name(note)}_VEL{vel_midi:03d}_RR{rri:02d}_REL.wav"
+                out_path_r = os.path.join(note_dir, fnr)
+                sf.write(out_path_r, yrel, int(sr), subtype=bitdepth)
+                log(f"Wrote {out_path_r}")
 
-                if n_rel > 0:
-                    seed_rel = stable_hash32(f"{session_tag}|{note}|{vi}|RR{rri}|release_noise") & 0x7FFFFFFF
-                    rng_rel = np.random.default_rng(int(seed_rel))
+                done += 1
+                if progress_fn:
+                    progress_fn(done, total)
 
-                    yrel = synth_release_tail(
-                        mip_low, mip_mid, mip_high,
-                        f0_base=f0_base,
-                        sr=sr,
-                        n=n_rel,
-                        v=v,
-                        base_pos=base_pos,
-                        base_mip=base_mip,
-                        note_keytrack=kt,
-                        note_name=note,
-                        vel_index=vi,
-                        rr_index=rri,
-                        rng_noise=rng_rel,
-                        phase0_low=ph_end0,
-                        phase0_mid=ph_end1,
-                        phase0_high=ph_end2,
-                        mip_block=int(args.mip_block),
-                        mip_smooth_tau=float(args.mip_smooth_tau),
-                    )
+    if progress_fn:
+        progress_fn(total, total)
+    log("DONE.")
+    return out_dir
 
-                    if bits is not None:
-                        yrel = add_tpdf_dither(yrel, bits=bits, rng=rng_rel)
+# =======================
+# GUI (PySide6 + qdarkstyle)
+# =======================
+def launch_gui():
+    from PySide6.QtCore import QObject, Signal, Slot, QThread, Qt
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+        QLabel, QLineEdit, QPushButton, QFileDialog, QSpinBox, QDoubleSpinBox,
+        QComboBox, QTextEdit, QProgressBar, QMessageBox, QGroupBox
+    )
+    import qdarkstyle
 
-                    fnr = f"SYN_{safe_name(note)}_VEL{vi:02d}_RR{rri:02d}_REL_({vlo:03d}-{vhi:03d}).wav"
-                    out_path_r = os.path.join(note_dir, fnr)
-                    sf.write(out_path_r, yrel, sr, subtype=args.bitdepth)
-                    print(f"Wrote {out_path_r}")
+    class Worker(QObject):
+        log = Signal(str)
+        progress = Signal(int, int)
+        finished = Signal(bool, str)  # ok, out_dir
+        def __init__(self, cfg: dict):
+            super().__init__()
+            self.cfg = cfg
+            self._cancel = False
 
-    print("DONE.")
+        @Slot()
+        def run(self):
+            try:
+                out = render_instrument(
+                    wt_dir=self.cfg["wt_dir"],
+                    out_dir=self.cfg["out_dir"],
+                    seed=self.cfg["seed"],
+                    sr=self.cfg["sr"],
+                    duration=self.cfg["duration"],
+                    release_time=self.cfg["release_time"],
+                    loop_start=self.cfg["loop_start"],
+                    loop_end=self.cfg["loop_end"],
+                    loop_xfade=self.cfg["loop_xfade"],
+                    bitdepth=self.cfg["bitdepth"],
+                    velocity_midi=self.cfg["velocity"],
+                    start_oct=self.cfg["start_oct"],
+                    end_oct=self.cfg["end_oct"],
+                    mip_block=self.cfg["mip_block"],
+                    mip_smooth_tau=self.cfg["mip_smooth_tau"],
+                    round_robins=self.cfg["round_robins"],
+                    log_fn=lambda s: self.log.emit(s),
+                    progress_fn=lambda d, t: self.progress.emit(d, t),
+                    cancel_check=lambda: self._cancel,
+                )
+                if self._cancel:
+                    self.finished.emit(False, out)
+                else:
+                    self.finished.emit(True, out)
+            except Exception:
+                tb = traceback.format_exc()
+                self.log.emit(tb)
+                self.finished.emit(False, "")
+
+        def cancel(self):
+            self._cancel = True
+
+    class MainWindow(QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("AudioEnvelopeTransferGUI")
+            self.setMinimumSize(980, 650)
+
+            self.thread = None
+            self.worker = None
+
+            root = QWidget()
+            self.setCentralWidget(root)
+
+            main = QVBoxLayout(root)
+            main.setSpacing(10)
+
+            # ---- Settings group
+            g = QGroupBox("Settings")
+            grid = QGridLayout(g)
+            grid.setHorizontalSpacing(10)
+            grid.setVerticalSpacing(8)
+
+            # wt_dir
+            grid.addWidget(QLabel("Wavetable folder (wt_dir):"), 0, 0)
+            self.wt_dir = QLineEdit(r"D:\WAVETABLE")
+            btn_wt = QPushButton("Browse...")
+            btn_wt.clicked.connect(self.browse_wt)
+            grid.addWidget(self.wt_dir, 0, 1)
+            grid.addWidget(btn_wt, 0, 2)
+
+            # out_dir
+            grid.addWidget(QLabel("Output folder (out_dir):"), 1, 0)
+            self.out_dir = QLineEdit("")
+            self.out_dir.setPlaceholderText("Auto (Output next to EXE)")
+            btn_out = QPushButton("Browse...")
+            btn_out.clicked.connect(self.browse_out)
+            grid.addWidget(self.out_dir, 1, 1)
+            grid.addWidget(btn_out, 1, 2)
+
+            # seed
+            grid.addWidget(QLabel("Seed (0 = random):"), 2, 0)
+            self.seed = QSpinBox()
+            self.seed.setRange(0, 2_000_000_000)
+            self.seed.setValue(0)
+            grid.addWidget(self.seed, 2, 1)
+
+            # sr
+            grid.addWidget(QLabel("Sample rate (sr):"), 3, 0)
+            self.sr = QSpinBox()
+            self.sr.setRange(8000, 192000)
+            self.sr.setValue(92000)
+            grid.addWidget(self.sr, 3, 1)
+
+            # duration
+            grid.addWidget(QLabel("Duration (s):"), 4, 0)
+            self.duration = QDoubleSpinBox()
+            self.duration.setDecimals(2)
+            self.duration.setRange(0.5, 60.0)
+            self.duration.setValue(15.0)
+            grid.addWidget(self.duration, 4, 1)
+
+            # velocity
+            grid.addWidget(QLabel("Velocity (1..127):"), 5, 0)
+            self.velocity = QSpinBox()
+            self.velocity.setRange(1, 127)
+            self.velocity.setValue(100)
+            grid.addWidget(self.velocity, 5, 1)
+
+            # round robins
+            grid.addWidget(QLabel("Round Robins (RR):"), 6, 0)
+            self.rr = QSpinBox()
+            self.rr.setRange(1, 8)
+            self.rr.setValue(3)
+            grid.addWidget(self.rr, 6, 1)
+
+            # bitdepth
+            grid.addWidget(QLabel("Bit depth:"), 7, 0)
+            self.bitdepth = QComboBox()
+            self.bitdepth.addItems(["FLOAT", "PCM_16", "PCM_24", "PCM_32"])
+            self.bitdepth.setCurrentText("FLOAT")
+            grid.addWidget(self.bitdepth, 7, 1)
+
+            # release_time
+            grid.addWidget(QLabel("Release time (s) (0 = off):"), 8, 0)
+            self.release_time = QDoubleSpinBox()
+            self.release_time.setDecimals(2)
+            self.release_time.setRange(0.0, 20.0)
+            self.release_time.setValue(0.0)
+            grid.addWidget(self.release_time, 8, 1)
+
+            # loop start/end/xfade
+            grid.addWidget(QLabel("Loop start / end / xfade (s):"), 9, 0)
+            row = QHBoxLayout()
+            self.loop_start = QDoubleSpinBox(); self.loop_start.setDecimals(3); self.loop_start.setRange(0.0, 60.0); self.loop_start.setValue(1.0)
+            self.loop_end   = QDoubleSpinBox(); self.loop_end.setDecimals(3); self.loop_end.setRange(0.0, 60.0); self.loop_end.setValue(4.0)
+            self.loop_xfade = QDoubleSpinBox(); self.loop_xfade.setDecimals(3); self.loop_xfade.setRange(0.0, 1.0);  self.loop_xfade.setValue(0.12)
+            row.addWidget(self.loop_start); row.addWidget(self.loop_end); row.addWidget(self.loop_xfade)
+            wrow = QWidget(); wrow.setLayout(row)
+            grid.addWidget(wrow, 9, 1)
+
+            # mip block / smooth
+            grid.addWidget(QLabel("Mip block / smooth tau:"), 10, 0)
+            row2 = QHBoxLayout()
+            self.mip_block = QSpinBox(); self.mip_block.setRange(64, 2048); self.mip_block.setValue(256)
+            self.mip_tau   = QDoubleSpinBox(); self.mip_tau.setDecimals(3); self.mip_tau.setRange(0.0, 1.0); self.mip_tau.setValue(0.030)
+            row2.addWidget(self.mip_block); row2.addWidget(self.mip_tau)
+            wrow2 = QWidget(); wrow2.setLayout(row2)
+            grid.addWidget(wrow2, 10, 1)
+
+            # fixed tones C-2..C8 (still shown)
+            grid.addWidget(QLabel("Roots (fixed):"), 11, 0)
+            roots_lbl = QLabel("C-2 .. C8 (11 tones)")
+            roots_lbl.setStyleSheet("opacity: 0.85;")
+            grid.addWidget(roots_lbl, 11, 1)
+
+            main.addWidget(g)
+
+            # ---- Controls
+            ctrl = QHBoxLayout()
+            self.btn_start = QPushButton("Start Render")
+            self.btn_cancel = QPushButton("Cancel")
+            self.btn_cancel.setEnabled(False)
+            self.btn_start.clicked.connect(self.start_render)
+            self.btn_cancel.clicked.connect(self.cancel_render)
+            ctrl.addWidget(self.btn_start)
+            ctrl.addWidget(self.btn_cancel)
+            ctrl.addStretch(1)
+            main.addLayout(ctrl)
+
+            # ---- Progress
+            self.progress = QProgressBar()
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+            main.addWidget(self.progress)
+
+            # ---- Logs
+            self.logs = QTextEdit()
+            self.logs.setReadOnly(True)
+            self.logs.setPlaceholderText("Logs...")
+            main.addWidget(self.logs, 1)
+
+            # ---- Footer centered
+            footer = QLabel("© 2025 Gabriel Golker")
+            footer.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+            footer.setStyleSheet("opacity: 0.80; padding: 6px;")
+            main.addWidget(footer)
+
+        def append_log(self, s: str):
+            self.logs.append(s)
+
+        def browse_wt(self):
+            d = QFileDialog.getExistingDirectory(self, "Select Wavetable Folder", self.wt_dir.text() or os.getcwd())
+            if d:
+                self.wt_dir.setText(d)
+
+        def browse_out(self):
+            d = QFileDialog.getExistingDirectory(self, "Select Output Folder", self.out_dir.text() or os.getcwd())
+            if d:
+                self.out_dir.setText(d)
+
+        def _set_running(self, running: bool):
+            self.btn_start.setEnabled(not running)
+            self.btn_cancel.setEnabled(running)
+
+        def start_render(self):
+            wt = self.wt_dir.text().strip()
+            if not wt or not os.path.isdir(wt):
+                QMessageBox.warning(self, "Invalid wt_dir", "Please select a valid wavetable folder.")
+                return
+
+            out = self.out_dir.text().strip()
+            out = out if out else None
+
+            cfg = {
+                "wt_dir": wt,
+                "out_dir": out,
+                "seed": int(self.seed.value()),
+                "sr": int(self.sr.value()),
+                "duration": float(self.duration.value()),
+                "release_time": float(self.release_time.value()),
+                "loop_start": float(self.loop_start.value()),
+                "loop_end": float(self.loop_end.value()),
+                "loop_xfade": float(self.loop_xfade.value()),
+                "bitdepth": str(self.bitdepth.currentText()),
+                "velocity": int(self.velocity.value()),
+                "start_oct": -2,
+                "end_oct": 8,
+                "mip_block": int(self.mip_block.value()),
+                "mip_smooth_tau": float(self.mip_tau.value()),
+                "round_robins": int(self.rr.value()),
+            }
+
+            self.logs.clear()
+            self.progress.setValue(0)
+            self._set_running(True)
+
+            self.thread = QThread()
+            self.worker = Worker(cfg)
+            self.worker.moveToThread(self.thread)
+
+            self.thread.started.connect(self.worker.run)
+            self.worker.log.connect(self.append_log)
+            self.worker.progress.connect(self.on_progress)
+            self.worker.finished.connect(self.on_finished)
+
+            self.worker.finished.connect(self.thread.quit)
+            self.worker.finished.connect(self.worker.deleteLater)
+            self.thread.finished.connect(self.thread.deleteLater)
+
+            self.thread.start()
+
+        def cancel_render(self):
+            if self.worker is not None:
+                self.append_log("Cancel requested...")
+                self.worker.cancel()
+                self.btn_cancel.setEnabled(False)
+
+        def on_progress(self, done: int, total: int):
+            if total <= 0:
+                self.progress.setValue(0)
+                return
+            pct = int(np.clip((done / total) * 100.0, 0.0, 100.0))
+            self.progress.setValue(pct)
+
+        def on_finished(self, ok: bool, out_dir: str):
+            self._set_running(False)
+            if ok:
+                self.append_log("")
+                self.append_log(f"✅ Finished. Output: {out_dir}")
+                QMessageBox.information(self, "Done", f"Render finished.\nOutput:\n{out_dir}")
+            else:
+                self.append_log("")
+                self.append_log("❌ Finished with errors or canceled.")
+                QMessageBox.warning(self, "Finished", "Render finished with errors or was canceled.")
+
+    app = QApplication(sys.argv)
+    app.setStyleSheet(qdarkstyle.load_stylesheet_pyside6())
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+# =======================
+# CLI (opcional) + default GUI
+# =======================
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--nogui", action="store_true", help="Run in CLI mode (no GUI)")
+
+    ap.add_argument("--wt_dir", default=r"D:\WAVETABLE", help="Carpeta con wavetables .wav (recursivo)")
+    ap.add_argument("--out_dir", default=None, help="Carpeta de salida (si None, se auto-elige)")
+    ap.add_argument("--seed", type=int, default=0)
+
+    ap.add_argument("--sr", type=int, default=92000)
+    ap.add_argument("--duration", type=float, default=15.0)
+    ap.add_argument("--release_time", type=float, default=0.0)
+
+    ap.add_argument("--loop_start", type=float, default=1.0)
+    ap.add_argument("--loop_end", type=float, default=4.0)
+    ap.add_argument("--loop_xfade", type=float, default=0.12)
+
+    ap.add_argument("--bitdepth", default="FLOAT", choices=["PCM_16","PCM_24","PCM_32","FLOAT"])
+    ap.add_argument("--velocity", type=int, default=100)
+
+    ap.add_argument("--start_oct", type=int, default=-2)
+    ap.add_argument("--end_oct", type=int, default=8)
+
+    ap.add_argument("--mip_block", type=int, default=256)
+    ap.add_argument("--mip_smooth_tau", type=float, default=0.030)
+
+    ap.add_argument("--round_robins", type=int, default=3)
+
+    args = ap.parse_args()
+
+    if not args.nogui:
+        launch_gui()
+        return
+
+    out = render_instrument(
+        wt_dir=args.wt_dir,
+        out_dir=args.out_dir,
+        seed=args.seed,
+        sr=args.sr,
+        duration=args.duration,
+        release_time=args.release_time,
+        loop_start=args.loop_start,
+        loop_end=args.loop_end,
+        loop_xfade=args.loop_xfade,
+        bitdepth=args.bitdepth,
+        velocity_midi=args.velocity,
+        start_oct=args.start_oct,
+        end_oct=args.end_oct,
+        mip_block=args.mip_block,
+        mip_smooth_tau=args.mip_smooth_tau,
+        round_robins=args.round_robins,
+    )
+    print("Output:", out)
 
 if __name__ == "__main__":
     main()
