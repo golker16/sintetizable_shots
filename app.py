@@ -3,7 +3,7 @@ import numpy as np
 import soundfile as sf
 
 # =======================
-# WAVETABLE CORE (reutilizado, sin UI)
+# WAVETABLE CORE (offline)
 # =======================
 WT_FRAME_SIZE = 2048
 WT_MIP_LEVELS = 8
@@ -44,7 +44,6 @@ def load_wavetable_wav(
     audio, _sr = sf.read(path, always_2d=False)
     audio = _to_mono_float(audio)
 
-    # pad a múltiplo de frame (mejor que truncar)
     if len(audio) < frame_size:
         audio = np.pad(audio, (0, frame_size - len(audio)))
     rem = len(audio) % frame_size
@@ -94,12 +93,9 @@ def _table_read_linear(table_1d: np.ndarray, phase: np.ndarray) -> np.ndarray:
     i1 = (i0 + 1) % n
     return (1.0 - frac) * table_1d[i0] + frac * table_1d[i1]
 
-def _pick_mip_level(f0_hz: float, mip_strength: float, n_levels: int) -> int:
-    f_ref = 55.0
-    ratio = max(f0_hz / f_ref, 1e-6)
-    lvl_float = math.log2(ratio) * float(np.clip(mip_strength, 0.0, 1.0))
-    return int(np.clip(math.floor(lvl_float), 0, n_levels - 1))
-
+# ==========================================================
+# (1) Anti-aliasing real: mip dinámico + crossfade entre niveles
+# ==========================================================
 def render_wavetable_osc_f0_array(
     f0_hz: np.ndarray,
     sr: int,
@@ -108,10 +104,6 @@ def render_wavetable_osc_f0_array(
     phase0: float,
     mip_strength: float,
 ):
-    """
-    Oscilador wavetable con f0 por-sample (vectorizado).
-    Para performance: elegimos mip level una sola vez usando f0 medio.
-    """
     f0_hz = np.asarray(f0_hz, dtype=np.float32)
     n = len(f0_hz)
 
@@ -123,18 +115,39 @@ def render_wavetable_osc_f0_array(
     ft = float(fidx - f0i)
     f1i = min(f0i + 1, n_frames - 1)
 
-    n_levels = len(mipmaps)
-    f0_mean = float(np.maximum(np.mean(f0_hz), 1.0))
-    L = _pick_mip_level(f0_mean, float(mip_strength), n_levels)
-    tables_L = mipmaps[L]
-    table = _lerp(tables_L[f0i], tables_L[f1i], ft).astype(np.float32, copy=False)
-
-    # phase: phase[i] = phase0 + sum_{k< i} f0[k]/sr
+    # phase vectorizado
     inc = (f0_hz / float(sr)).astype(np.float32)
-    c = np.cumsum(inc, dtype=np.float64)  # estable numéricamente
+    c = np.cumsum(inc, dtype=np.float64)
     phase = (float(phase0) + np.concatenate(([0.0], c[:-1].astype(np.float32)))) % 1.0
 
-    out = _table_read_linear(table, phase).astype(np.float32, copy=False)
+    # mip level por-sample + crossfade L<->L+1
+    f_ref = 55.0
+    ratio = np.maximum(f0_hz / f_ref, 1e-6)
+    lvl_float = (np.log2(ratio) * float(np.clip(mip_strength, 0.0, 1.0))).astype(np.float32)
+
+    n_levels = len(mipmaps)
+    L0 = np.floor(lvl_float).astype(np.int32)
+    frac = (lvl_float - L0.astype(np.float32)).astype(np.float32)
+    L0 = np.clip(L0, 0, n_levels - 1)
+    L1 = np.clip(L0 + 1, 0, n_levels - 1)
+
+    out = np.zeros(n, dtype=np.float32)
+
+    for L in np.unique(np.concatenate([L0, L1])):
+        mask0 = (L0 == L)
+        mask1 = (L1 == L)
+        if not (np.any(mask0) or np.any(mask1)):
+            continue
+
+        tables_L = mipmaps[int(L)]
+        table = _lerp(tables_L[f0i], tables_L[f1i], ft).astype(np.float32, copy=False)
+        yL = _table_read_linear(table, phase).astype(np.float32, copy=False)
+
+        if np.any(mask0):
+            out[mask0] += yL[mask0] * (1.0 - frac[mask0])
+        if np.any(mask1):
+            out[mask1] += yL[mask1] * (frac[mask1])
+
     return out
 
 # =======================
@@ -170,23 +183,24 @@ def list_wav_files(folder: str):
 def safe_name(s: str) -> str:
     return s.replace("#","s").replace("-","m")
 
-def velocity_bins(n_layers: int):
-    edges = np.linspace(1.0, 128.0, n_layers + 1)
+# ==========================================
+# (2) Velocities perceptuales (más capas en soft)
+# ==========================================
+def velocity_bins_perceptual(n_layers: int, curve: float = 2.2):
+    x = np.linspace(0.0, 1.0, n_layers + 1)
+    edges = 1.0 + 127.0 * (x ** curve)
     bins = []
-    prev_hi = 0
+    prev = 0
     for i in range(n_layers):
         lo = int(math.floor(edges[i]))
         hi = int(math.floor(edges[i+1] - 1e-9))
-        lo = max(lo, prev_hi + 1)
+        lo = max(lo, prev + 1)
         hi = max(hi, lo)
         if i == n_layers - 1:
             hi = 127
         bins.append((lo, hi))
-        prev_hi = hi
+        prev = hi
     return bins
-
-def sat_tanh(x: np.ndarray, drive: float) -> np.ndarray:
-    return np.tanh(float(drive) * x).astype(np.float32, copy=False)
 
 def db_to_lin(db: float) -> float:
     return float(10.0 ** (db / 20.0))
@@ -194,12 +208,41 @@ def db_to_lin(db: float) -> float:
 def exp_decay(t: np.ndarray, tau: float) -> np.ndarray:
     return np.exp(-t / float(tau)).astype(np.float32)
 
+# ==========================================
+# Dither TPDF (solo si exportas PCM_*)
+# ==========================================
+def add_tpdf_dither(y: np.ndarray, bits: int, rng: np.random.Generator):
+    lsb = 1.0 / (2 ** (bits - 1))
+    d = (rng.random(len(y), dtype=np.float32) - rng.random(len(y), dtype=np.float32)) * lsb
+    return (y + d).astype(np.float32, copy=False)
+
+def _bits_for_subtype(subtype: str) -> int | None:
+    st = subtype.upper()
+    if st == "PCM_16":
+        return 16
+    if st == "PCM_24":
+        return 24
+    if st == "PCM_32":
+        return 32
+    # FLOAT/DOUBLE -> no dither
+    return None
+
+# ==========================================
+# Humanize determinístico: hash estable + hash_float01
+# ==========================================
+def stable_hash32(s: str) -> int:
+    # FNV-1a 32-bit
+    h = 2166136261
+    for b in s.encode("utf-8"):
+        h ^= b
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+def hash_float01(a: int) -> float:
+    x = (int(a) * 1103515245 + 12345) & 0x7fffffff
+    return x / 0x7fffffff
+
 def adsr_env(n: int, sr: int, v: float) -> np.ndarray:
-    """
-    ADSR más realista por velocity:
-    - suave: ataque más lento / release más largo / sustain más bajo
-    - fuerte: ataque corto / sustain alto / release algo más corto
-    """
     v = float(np.clip(v, 0.0, 1.0))
     atk = np.interp(v, [0.0, 1.0], [0.120, 0.004])
     dec = np.interp(v, [0.0, 1.0], [1.40, 0.45])
@@ -214,7 +257,6 @@ def adsr_env(n: int, sr: int, v: float) -> np.ndarray:
     env = np.zeros(n, dtype=np.float32)
     i = 0
     if aN > 0:
-        # ataque curva (suave = curva más lenta)
         a = np.linspace(0.0, 1.0, aN, endpoint=False, dtype=np.float32)
         env[i:i+aN] = a ** np.interp(v, [0,1], [1.8, 0.7])
         i += aN
@@ -231,7 +273,7 @@ def adsr_env(n: int, sr: int, v: float) -> np.ndarray:
     return env
 
 # =======================
-# SYNTH: 3 OSC fijos (3 wavetables) + performance por velocity
+# SYNTH: 3 OSC fijos (3 wavetables) + mejoras
 # =======================
 def synth_one_shot(
     mip_low, mip_mid, mip_high,
@@ -241,24 +283,20 @@ def synth_one_shot(
     v: float,
     base_pos, base_mip, base_phase,
     note_keytrack: float,
-    rng_local: np.random.Generator,
+    note_name: str,
+    vel_index: int,
+    rng_noise: np.random.Generator,
 ):
-    """
-    v: 0..1 (velocity)
-    note_keytrack: 0..1 (más alto => nota más aguda)
-    """
     v = float(np.clip(v, 0.0, 1.0))
     kt = float(np.clip(note_keytrack, 0.0, 1.0))
-
     t = (np.arange(n, dtype=np.float32) / float(sr))
 
-    # ---- dinámica (volumen) en dB: suave muy bajo, fuerte cercano a 0dB ----
-    # Esto hace que las capas suaves no parezcan "solo un poco más bajo", sino realmente tocadas suave.
+    # dinámica (volumen) en dB
     amp_db = np.interp(v**1.65, [0.0, 1.0], [-32.0, -3.0])
     amp = db_to_lin(amp_db)
 
-    # ---- “interprete”: pitch env + vibrato sutil (más fuerte => más evidente) ----
-    pitch_attack_cents = (2.0 + 10.0*(v**0.9)) * (1.0 + 0.25*kt)  # agudas un poco más nerviosas
+    # pitch env + vibrato
+    pitch_attack_cents = (2.0 + 10.0*(v**0.9)) * (1.0 + 0.25*kt)
     pitch_env = pitch_attack_cents * exp_decay(t, tau=np.interp(v, [0,1], [0.075, 0.040]))
 
     vib_rate = np.interp(v, [0,1], [4.2, 5.6])
@@ -268,36 +306,71 @@ def synth_one_shot(
     cents_total = (pitch_env + vibrato).astype(np.float32)
     f0 = (f0_base * (2.0 ** (cents_total / 1200.0))).astype(np.float32)
 
-    # ---- micro-detune fijo por sample (no “chorus”, solo vida) ----
-    det_cents = float(rng_local.uniform(-1.5, 1.5))
-    det = float(2.0 ** (det_cents / 1200.0))
-    f0 = (f0 * det).astype(np.float32)
+    # ---------------------------------------------
+    # (1) Detune “real” por oscilador (no uno global)
+    # ---------------------------------------------
+    h = stable_hash32(f"{note_name}|{vel_index}|{int(kt*1000)}|{int(v*10000)}")
+    base_det = (hash_float01(h) * 2.0 - 1.0)  # -1..1
 
-    # ---- WT scan dependiente de velocity y keytracking ----
-    # (no random): consistente y “más brillante” a más velocidad y más nota
+    det_low_c  = 0.30 * base_det
+    det_mid_c  = 0.90 * base_det + 0.35
+    det_high_c = 1.30 * base_det - 0.55
+
+    spread = np.interp(v, [0,1], [0.85, 1.15])
+    det_low_c  *= spread
+    det_mid_c  *= spread
+    det_high_c *= spread
+
+    f0_low  = (f0 * (2.0 ** (det_low_c  / 1200.0))).astype(np.float32)
+    f0_mid  = (f0 * (2.0 ** (det_mid_c  / 1200.0))).astype(np.float32)
+    f0_high = (f0 * (2.0 ** (det_high_c / 1200.0))).astype(np.float32)
+
+    # WT scan dependiente de velocity y keytracking (constante por sample)
     pos_low  = float(np.clip(base_pos[0] + 0.08*(v-0.5) + 0.05*(kt-0.5), 0.0, 1.0))
     pos_mid  = float(np.clip(base_pos[1] + 0.11*(v-0.5) + 0.06*(kt-0.5), 0.0, 1.0))
     pos_high = float(np.clip(base_pos[2] + 0.16*(v-0.5) + 0.08*(kt-0.5), 0.0, 1.0))
 
-    # ---- 3 capas tipo low/mid/high (armónicos) ----
-    y0 = render_wavetable_osc_f0_array(f0 * 1.0, sr, mip_low,  position=pos_low,  phase0=base_phase[0], mip_strength=base_mip[0])
-    y1 = render_wavetable_osc_f0_array(f0 * 2.0, sr, mip_mid,  position=pos_mid,  phase0=base_phase[1], mip_strength=base_mip[1])
-    y2 = render_wavetable_osc_f0_array(f0 * 4.0, sr, mip_high, position=pos_high, phase0=base_phase[2], mip_strength=base_mip[2])
+    # 3 capas low/mid/high (armónicos)
+    y0 = render_wavetable_osc_f0_array(f0_low  * 1.0, sr, mip_low,  position=pos_low,  phase0=base_phase[0], mip_strength=base_mip[0])
+    y1 = render_wavetable_osc_f0_array(f0_mid  * 2.0, sr, mip_mid,  position=pos_mid,  phase0=base_phase[1], mip_strength=base_mip[1])
+    y2 = render_wavetable_osc_f0_array(f0_high * 4.0, sr, mip_high, position=pos_high, phase0=base_phase[2], mip_strength=base_mip[2])
 
-    # ---- mezcla por velocity + keytracking ----
-    # suave: más low / menos high; fuerte: aparece high + más mid
+    # mezcla base por velocity + keytracking
     bright = (v**0.65) * (0.85 + 0.30*kt)
+    w_low  = float(np.clip(0.80 - 0.22*bright, 0.40, 0.85))
+    w_mid  = float(np.clip(0.28 + 0.40*bright, 0.20, 0.75))
+    w_high = float(np.clip(0.02 + 0.70*(bright**1.20), 0.00, 0.70))
 
-    w_low  = np.clip(0.80 - 0.22*bright, 0.40, 0.85)
-    w_mid  = np.clip(0.28 + 0.40*bright, 0.20, 0.75)
-    w_high = np.clip(0.02 + 0.70*(bright**1.20), 0.00, 0.70)
+    # ---------------------------------------------
+    # (4) Filter envelope: ataque brillante que cae (con compensación por registro)
+    # ---------------------------------------------
+    fenv_amt = np.interp(v, [0,1], [0.20, 0.85]) * (0.8 + 0.3*kt)
+    fenv_amt *= (1.0 - 0.20*kt)  # menos snap en agudos (C7/C8)
+    fenv = (fenv_amt * exp_decay(t, tau=np.interp(v, [0,1], [0.20, 0.08]))).astype(np.float32)
 
-    y = (w_low*y0 + w_mid*y1 + w_high*y2).astype(np.float32, copy=False)
+    w_high_t = np.clip(w_high + 0.35 * fenv, 0.0, 0.9).astype(np.float32)
+    w_mid_t  = np.clip(w_mid  + 0.10 * fenv, 0.0, 0.9).astype(np.float32)
+    w_low_t  = np.clip(w_low  - 0.12 * fenv, 0.0, 0.9).astype(np.float32)
 
-    # ---- transient realista (ataque) ----
-    # burst corto de “aire” (diferenciador = highpass barato y vectorizado)
-    noise = rng_local.standard_normal(n).astype(np.float32)
-    hp_noise = (noise - np.concatenate(([0.0], noise[:-1]))).astype(np.float32)  # highpass simple
+    # (2) Micro-movimiento tímbrico determinístico: LFO lento (modula pesos) + “air”
+    h2 = stable_hash32(f"{note_name}|{vel_index}|LFO")
+    rate = np.interp(hash_float01(h2), [0,1], [0.18, 0.55])
+    phase_lfo = 2.0 * np.pi * hash_float01(h2 ^ 0xA5A5A5A5)
+    lfo = np.sin(2.0*np.pi*rate*t + phase_lfo).astype(np.float32)
+
+    depth = np.interp(v, [0,1], [0.06, 0.015]) * (0.85 + 0.25*kt)
+    w_mod = (1.0 + depth * lfo).astype(np.float32)
+
+    w_mid_t  = np.clip(w_mid_t  * w_mod, 0.0, 0.95).astype(np.float32)
+    w_high_t = np.clip(w_high_t * (1.0 + 0.6*depth*lfo), 0.0, 0.95).astype(np.float32)
+    w_low_t  = np.clip(w_low_t  * (1.0 - 0.35*depth*lfo), 0.0, 0.95).astype(np.float32)
+
+    y = (w_low_t*y0 + w_mid_t*y1 + w_high_t*y2).astype(np.float32, copy=False)
+
+    # transient (ataque) + noise floor
+    noise = rng_noise.standard_normal(n).astype(np.float32)
+    hp_noise = (noise - np.concatenate(([0.0], noise[:-1]))).astype(np.float32)
+
     trans_len = int(np.interp(v, [0,1], [0.010, 0.030]) * sr)
     trans = np.zeros(n, dtype=np.float32)
     if trans_len > 8:
@@ -306,18 +379,41 @@ def synth_one_shot(
     trans_gain = np.interp(v, [0,1], [0.010, 0.060]) * (0.9 + 0.3*kt)
     y = (y + trans_gain * trans).astype(np.float32, copy=False)
 
-    # ---- ADSR + saturación (más fuerte => más drive) ----
+    # (3) Transient más creíble: click band-limited + keytracked
+    click_len = int(np.interp(v, [0,1], [0.0015, 0.0030]) * sr)
+    if click_len > 8:
+        click_env = exp_decay(t[:click_len], tau=np.interp(v, [0,1], [0.0008, 0.0016]))
+        click = np.zeros(n, dtype=np.float32)
+        click[:click_len] = click_env
+
+        click_hp = click - np.concatenate(([0.0], click[:-1]))
+        k = 9
+        click_lp = np.convolve(click_hp, np.ones(k, dtype=np.float32)/k, mode="same").astype(np.float32)
+
+        click_gain = np.interp(v, [0,1], [0.020, 0.090]) * (0.8 + 0.35*kt)
+        y = (y + click_gain * click_lp).astype(np.float32, copy=False)
+
+    # ADSR
     env = adsr_env(n, sr, v)
     y = (y * env).astype(np.float32, copy=False)
 
-    drive = np.interp(v, [0,1], [1.10, 2.70]) * (0.95 + 0.25*kt)
-    y = sat_tanh(y, drive=drive)
+    # saturación con drive + bump en ataque (fenv) + (4) compensación por registro
+    drive_base = np.interp(v, [0,1], [1.10, 2.70])
+    drive_base *= (1.05 - 0.25*kt)   # menos drive en notas altas
+    drive_base *= (0.95 + 0.15*kt)   # pero no lo mates
+    drive_env = (drive_base * (1.0 + 0.90 * fenv)).astype(np.float32)
+    y = np.tanh(drive_env * y).astype(np.float32, copy=False)
 
-    # ---- “breath/noise floor” (más presente en vel bajas) ----
     floor = np.interp(v, [0,1], [0.006, 0.0015])
     y = (y + floor * hp_noise * (env**0.7)).astype(np.float32, copy=False)
 
-    # ---- aplicar volumen final (NO normalizar por archivo) ----
+    # (5) Gain staging por RMS (antes del amp final)
+    rms = float(np.sqrt(np.mean(y*y) + 1e-12))
+    target_rms = db_to_lin(np.interp(v**1.35, [0,1], [-28.0, -10.0]))
+    corr = float(np.clip(target_rms / (rms + 1e-12), 0.5, 1.8))
+    y = (y * corr).astype(np.float32, copy=False)
+
+    # aplicar volumen final (NO normalizar por archivo)
     y = (y * amp * 0.85).astype(np.float32, copy=False)
 
     return np.clip(y, -1.0, 1.0).astype(np.float32, copy=False)
@@ -329,27 +425,34 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wt_dir", default=r"D:\WAVETABLE", help="Carpeta con wavetables .wav (recursivo)")
     ap.add_argument("--out_dir", required=True, help="Carpeta de salida")
-    ap.add_argument("--seed", type=int, default=0, help="0 = random real, otro = reproducible")
+    ap.add_argument("--seed", type=int, default=0, help="0 = random real (elige wavetables/patch distinto), otro = reproducible")
     ap.add_argument("--sr", type=int, default=92000)
     ap.add_argument("--duration", type=float, default=15.0)
-    ap.add_argument("--bitdepth", default="PCM_24", choices=["PCM_16","PCM_24","PCM_32"])
+
+    # recomendado para DecentSampler: FLOAT (32-bit float)
+    ap.add_argument("--bitdepth", default="FLOAT", choices=["PCM_16","PCM_24","PCM_32","FLOAT"])
     ap.add_argument("--vel_layers", type=int, default=25)
 
     # 11 roots: C-2..C8 (inclusive)
     ap.add_argument("--start_oct", type=int, default=-2)
     ap.add_argument("--end_oct", type=int, default=8)
 
+    # curva de perceptual bins (2.2 default)
+    ap.add_argument("--vel_curve", type=float, default=2.2)
+
     args = ap.parse_args()
 
     sr = int(args.sr)
     n = int(sr * float(args.duration))
+
+    # RNG global (selección de 3 wavetables + patch base)
     rng = np.random.default_rng(None if args.seed == 0 else args.seed)
 
     wt_files = list_wav_files(args.wt_dir)
     if len(wt_files) < 3:
         raise RuntimeError(f"Necesitas al menos 3 wavetables .wav en {args.wt_dir}")
 
-    # ✅ MISMA SESIÓN = mismos 3 osciladores (3 wavetables) para TODO
+    # ✅ MISMA SESIÓN = mismos 3 osciladores (3 wavetables) para TODO el render
     wt_low, wt_mid, wt_high = rng.choice(wt_files, size=3, replace=False).tolist()
 
     print("Wavetables fijos para toda la sesión (low/mid/high):")
@@ -366,7 +469,8 @@ def main():
     base_mip   = [float(rng.uniform(0.65, 1.0)) for _ in range(3)]
     base_phase = [float(rng.uniform(0.0, 1.0)) for _ in range(3)]
 
-    vel_bins = velocity_bins(int(args.vel_layers))
+    # bins perceptuales
+    vel_bins = velocity_bins_perceptual(int(args.vel_layers), curve=float(args.vel_curve))
 
     roots = [f"C{o}" for o in range(int(args.start_oct), int(args.end_oct) + 1)]
     total = len(roots) * len(vel_bins)
@@ -377,8 +481,18 @@ def main():
     print(f"Generando {len(roots)} roots (C{args.start_oct}..C{args.end_oct}) x {len(vel_bins)} vel = {total} WAVs")
     print(f"SR={sr}  DUR={args.duration}s  BIT={args.bitdepth}")
 
-    # para keytracking (0..1): C-2 = 0, C8 = 1
+    # keytracking 0..1
     kt_den = max(1.0, float(args.end_oct - args.start_oct))
+
+    # session_tag para semillas estables por muestra
+    session_tag = (
+        f"{os.path.basename(wt_low)}|{os.path.basename(wt_mid)}|{os.path.basename(wt_high)}|"
+        f"{base_pos[0]:.4f},{base_pos[1]:.4f},{base_pos[2]:.4f}|"
+        f"{base_mip[0]:.4f},{base_mip[1]:.4f},{base_mip[2]:.4f}|"
+        f"{base_phase[0]:.4f},{base_phase[1]:.4f},{base_phase[2]:.4f}"
+    )
+
+    bits = _bits_for_subtype(args.bitdepth)
 
     for note in roots:
         f0_base = note_name_to_hz(note)
@@ -392,9 +506,9 @@ def main():
             v_center = 0.5 * (vlo + vhi)
             v = float(np.clip(v_center / 127.0, 0.0, 1.0))
 
-            # RNG local: mantiene coherencia por nota/vel si seed != 0
-            local_seed = None if args.seed == 0 else (args.seed * 1000003 + (hash((note, vi)) & 0x7FFFFFFF))
-            rng_local = np.random.default_rng(local_seed)
+            # RNG para ruido/transient/dither: semilla ESTABLE por muestra (aunque seed=0)
+            seed_noise = stable_hash32(f"{session_tag}|{note}|{vi}|noise") & 0x7FFFFFFF
+            rng_noise = np.random.default_rng(int(seed_noise))
 
             y = synth_one_shot(
                 mip_low, mip_mid, mip_high,
@@ -406,8 +520,14 @@ def main():
                 base_mip=base_mip,
                 base_phase=base_phase,
                 note_keytrack=kt,
-                rng_local=rng_local,
+                note_name=note,
+                vel_index=vi,
+                rng_noise=rng_noise,
             )
+
+            # dither solo si exportas PCM_*
+            if bits is not None:
+                y = add_tpdf_dither(y, bits=bits, rng=rng_noise)
 
             fn = f"SYN_{safe_name(note)}_VEL{vi:02d}_({vlo:03d}-{vhi:03d}).wav"
             out_path = os.path.join(note_dir, fn)
@@ -418,5 +538,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
