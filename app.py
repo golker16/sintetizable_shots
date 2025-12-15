@@ -3,7 +3,7 @@ import numpy as np
 import soundfile as sf
 
 # =======================
-# Wavetable core (tomado de tu base, sin UI)
+# WAVETABLE CORE (reutilizado, sin UI)
 # =======================
 WT_FRAME_SIZE = 2048
 WT_MIP_LEVELS = 8
@@ -95,60 +95,55 @@ def _table_read_linear(table_1d: np.ndarray, phase: np.ndarray) -> np.ndarray:
     return (1.0 - frac) * table_1d[i0] + frac * table_1d[i1]
 
 def _pick_mip_level(f0_hz: float, mip_strength: float, n_levels: int) -> int:
-    # selector simple como el tuyo
     f_ref = 55.0
     ratio = max(f0_hz / f_ref, 1e-6)
     lvl_float = math.log2(ratio) * float(np.clip(mip_strength, 0.0, 1.0))
-    lvl = int(np.clip(math.floor(lvl_float), 0, n_levels - 1))
-    return lvl
+    return int(np.clip(math.floor(lvl_float), 0, n_levels - 1))
 
-def render_wavetable_osc_constant(
-    f0_hz: float,
+def render_wavetable_osc_f0_array(
+    f0_hz: np.ndarray,
     sr: int,
-    n_samples: int,
     mipmaps: list,
-    position: float = 0.0,
-    phase0: float = 0.0,
-    mip_strength: float = 1.0,
+    position: float,
+    phase0: float,
+    mip_strength: float,
 ):
-    n_levels = len(mipmaps)
+    """
+    Oscilador wavetable con f0 por-sample (vectorizado).
+    Para performance: elegimos mip level una sola vez usando f0 medio.
+    """
+    f0_hz = np.asarray(f0_hz, dtype=np.float32)
+    n = len(f0_hz)
+
     base_frames = mipmaps[0]
     n_frames = base_frames.shape[0]
-
     pos = float(np.clip(position, 0.0, 1.0))
     fidx = pos * (n_frames - 1)
     f0i = int(np.floor(fidx))
     ft = float(fidx - f0i)
     f1i = min(f0i + 1, n_frames - 1)
 
-    L = _pick_mip_level(float(f0_hz), float(mip_strength), n_levels)
+    n_levels = len(mipmaps)
+    f0_mean = float(np.maximum(np.mean(f0_hz), 1.0))
+    L = _pick_mip_level(f0_mean, float(mip_strength), n_levels)
     tables_L = mipmaps[L]
-    t0 = tables_L[f0i]
-    t1 = tables_L[f1i]
-    table = _lerp(t0, t1, ft).astype(np.float32, copy=False)
+    table = _lerp(tables_L[f0i], tables_L[f1i], ft).astype(np.float32, copy=False)
 
-    # phase vectorizado
-    phase = (float(phase0) + (np.arange(n_samples, dtype=np.float32) * (float(f0_hz) / float(sr)))) % 1.0
+    # phase: phase[i] = phase0 + sum_{k< i} f0[k]/sr
+    inc = (f0_hz / float(sr)).astype(np.float32)
+    c = np.cumsum(inc, dtype=np.float64)  # estable numéricamente
+    phase = (float(phase0) + np.concatenate(([0.0], c[:-1].astype(np.float32)))) % 1.0
+
     out = _table_read_linear(table, phase).astype(np.float32, copy=False)
-
-    # phase final (por si algún día lo necesitas)
-    ph_end = float((float(phase0) + (n_samples * (float(f0_hz) / float(sr)))) % 1.0)
-    return out, ph_end
+    return out
 
 # =======================
-# Musical utils
+# MUSICAL / FILE UTILS
 # =======================
 NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
 
-def name_c_oct(octv: int) -> str:
-    return f"C{octv}"
-
 def note_name_to_hz(note: str) -> float:
-    # A4=440, formato "C-2", "C4", "C#3", etc. (12-TET)
-    # Convención: C4 = 261.625565...
-    # MIDI equivalente: C4 = 60
     note = note.strip().upper().replace(" ", "")
-    # parse nombre + octava
     if len(note) < 2:
         raise ValueError(f"Nota inválida: {note}")
     if note[1] == "#":
@@ -159,14 +154,23 @@ def note_name_to_hz(note: str) -> float:
         oct_str = note[1:]
     if nn not in NOTE_NAMES:
         raise ValueError(f"Nota inválida: {note}")
-    octv = int(oct_str)  # acepta negativos
+    octv = int(oct_str)
     semitone = NOTE_NAMES.index(nn)
-    midi = (octv + 1) * 12 + semitone  # porque C-1=0
+    midi = (octv + 1) * 12 + semitone  # C-1 = 0
     hz = 440.0 * (2.0 ** ((midi - 69) / 12.0))
     return float(hz)
 
+def list_wav_files(folder: str):
+    files = glob.glob(os.path.join(folder, "**/*.wav"), recursive=True)
+    files += glob.glob(os.path.join(folder, "**/*.WAV"), recursive=True)
+    files = [f for f in files if os.path.isfile(f)]
+    files.sort(key=lambda p: p.lower())
+    return files
+
+def safe_name(s: str) -> str:
+    return s.replace("#","s").replace("-","m")
+
 def velocity_bins(n_layers: int):
-    # 25 capas => 25 rangos dentro de 1..127
     edges = np.linspace(1.0, 128.0, n_layers + 1)
     bins = []
     prev_hi = 0
@@ -181,12 +185,26 @@ def velocity_bins(n_layers: int):
         prev_hi = hi
     return bins
 
-def adsr_env(n: int, sr: int, v_norm: float) -> np.ndarray:
-    # más fuerte => ataque más corto y sustain más alto
-    atk = np.interp(v_norm, [0.0, 1.0], [0.090, 0.006])
-    dec = np.interp(v_norm, [0.0, 1.0], [1.20, 0.55])
-    sus = np.interp(v_norm, [0.0, 1.0], [0.50, 0.88])
-    rel = np.interp(v_norm, [0.0, 1.0], [3.20, 1.70])
+def sat_tanh(x: np.ndarray, drive: float) -> np.ndarray:
+    return np.tanh(float(drive) * x).astype(np.float32, copy=False)
+
+def db_to_lin(db: float) -> float:
+    return float(10.0 ** (db / 20.0))
+
+def exp_decay(t: np.ndarray, tau: float) -> np.ndarray:
+    return np.exp(-t / float(tau)).astype(np.float32)
+
+def adsr_env(n: int, sr: int, v: float) -> np.ndarray:
+    """
+    ADSR más realista por velocity:
+    - suave: ataque más lento / release más largo / sustain más bajo
+    - fuerte: ataque corto / sustain alto / release algo más corto
+    """
+    v = float(np.clip(v, 0.0, 1.0))
+    atk = np.interp(v, [0.0, 1.0], [0.120, 0.004])
+    dec = np.interp(v, [0.0, 1.0], [1.40, 0.45])
+    sus = np.interp(v, [0.0, 1.0], [0.40, 0.90])
+    rel = np.interp(v, [0.0, 1.0], [3.80, 1.50])
 
     aN = int(atk * sr)
     dN = int(dec * sr)
@@ -194,102 +212,122 @@ def adsr_env(n: int, sr: int, v_norm: float) -> np.ndarray:
     sN = max(0, n - (aN + dN + rN))
 
     env = np.zeros(n, dtype=np.float32)
-    idx = 0
+    i = 0
     if aN > 0:
-        env[idx:idx+aN] = np.linspace(0.0, 1.0, aN, endpoint=False, dtype=np.float32)
-        idx += aN
+        # ataque curva (suave = curva más lenta)
+        a = np.linspace(0.0, 1.0, aN, endpoint=False, dtype=np.float32)
+        env[i:i+aN] = a ** np.interp(v, [0,1], [1.8, 0.7])
+        i += aN
     if dN > 0:
-        env[idx:idx+dN] = np.linspace(1.0, sus, dN, endpoint=False, dtype=np.float32)
-        idx += dN
+        env[i:i+dN] = np.linspace(1.0, sus, dN, endpoint=False, dtype=np.float32)
+        i += dN
     if sN > 0:
-        env[idx:idx+sN] = sus
-        idx += sN
-    if idx < n:
-        tail = n - idx
-        start = env[idx-1] if idx > 0 else sus
-        env[idx:] = np.linspace(start, 0.0, tail, endpoint=True, dtype=np.float32)
+        env[i:i+sN] = sus
+        i += sN
+    if i < n:
+        tail = n - i
+        start = env[i-1] if i > 0 else sus
+        env[i:] = np.linspace(start, 0.0, tail, endpoint=True, dtype=np.float32)
     return env
 
-def sat_tanh(x: np.ndarray, drive: float) -> np.ndarray:
-    return np.tanh(float(drive) * x).astype(np.float32, copy=False)
-
 # =======================
-# File utils
-# =======================
-def list_wav_files(folder: str):
-    files = glob.glob(os.path.join(folder, "**/*.wav"), recursive=True)
-    files += glob.glob(os.path.join(folder, "**/*.WAV"), recursive=True)
-    files = [f for f in files if os.path.isfile(f)]
-    files.sort(key=lambda p: p.lower())
-    return files
-
-def safe_name(s: str) -> str:
-    return s.replace("#","s").replace("-","m")
-
-# =======================
-# Synth patch (3 capas fijas: low/mid/high)
+# SYNTH: 3 OSC fijos (3 wavetables) + performance por velocity
 # =======================
 def synth_one_shot(
-    mipmaps_low, mipmaps_mid, mipmaps_high,
-    note_hz: float,
+    mip_low, mip_mid, mip_high,
+    f0_base: float,
     sr: int,
-    n_samples: int,
-    v_norm: float,
+    n: int,
+    v: float,
     base_pos, base_mip, base_phase,
+    note_keytrack: float,
     rng_local: np.random.Generator,
 ):
-    # dinámica (curva tipo “real”)
-    amp = 0.08 + 0.92 * (v_norm ** 1.85)
+    """
+    v: 0..1 (velocity)
+    note_keytrack: 0..1 (más alto => nota más aguda)
+    """
+    v = float(np.clip(v, 0.0, 1.0))
+    kt = float(np.clip(note_keytrack, 0.0, 1.0))
 
-    # más fuerte => más brillo y un poco más drive
-    drive = float(np.interp(v_norm, [0.0, 1.0], [1.15, 2.60]))
+    t = (np.arange(n, dtype=np.float32) / float(sr))
 
-    # micro detune sutil (determinístico por (nota,vel) si usas same seed)
-    cents = float(rng_local.uniform(-2.0, 2.0))
-    detune = 2.0 ** (cents / 1200.0)
+    # ---- dinámica (volumen) en dB: suave muy bajo, fuerte cercano a 0dB ----
+    # Esto hace que las capas suaves no parezcan "solo un poco más bajo", sino realmente tocadas suave.
+    amp_db = np.interp(v**1.65, [0.0, 1.0], [-32.0, -3.0])
+    amp = db_to_lin(amp_db)
 
-    # “patch” consistente:
-    # - low toca a f0
-    # - mid toca a 2*f0
-    # - high toca a 4*f0
-    # (esto te da una sensación de capas espectrales SIN filtros pesados)
-    f0_low  = note_hz * detune
-    f0_mid  = note_hz * 2.0 * detune
-    f0_high = note_hz * 4.0 * detune
+    # ---- “interprete”: pitch env + vibrato sutil (más fuerte => más evidente) ----
+    pitch_attack_cents = (2.0 + 10.0*(v**0.9)) * (1.0 + 0.25*kt)  # agudas un poco más nerviosas
+    pitch_env = pitch_attack_cents * exp_decay(t, tau=np.interp(v, [0,1], [0.075, 0.040]))
 
-    # escaneo de wavetable: leve movimiento por velocidad (mantiene coherencia)
-    pos_low  = float(np.clip(base_pos[0] + 0.10 * (v_norm - 0.5), 0.0, 1.0))
-    pos_mid  = float(np.clip(base_pos[1] + 0.14 * (v_norm - 0.5), 0.0, 1.0))
-    pos_high = float(np.clip(base_pos[2] + 0.20 * (v_norm - 0.5), 0.0, 1.0))
+    vib_rate = np.interp(v, [0,1], [4.2, 5.6])
+    vib_depth_cents = np.interp(v, [0,1], [0.2, 1.2])
+    vibrato = vib_depth_cents * np.sin(2.0*np.pi*vib_rate*t).astype(np.float32)
 
-    y0, _ = render_wavetable_osc_constant(f0_low,  sr, n_samples, mipmaps_low,  position=pos_low,  phase0=base_phase[0], mip_strength=base_mip[0])
-    y1, _ = render_wavetable_osc_constant(f0_mid,  sr, n_samples, mipmaps_mid,  position=pos_mid,  phase0=base_phase[1], mip_strength=base_mip[1])
-    y2, _ = render_wavetable_osc_constant(f0_high, sr, n_samples, mipmaps_high, position=pos_high, phase0=base_phase[2], mip_strength=base_mip[2])
+    cents_total = (pitch_env + vibrato).astype(np.float32)
+    f0 = (f0_base * (2.0 ** (cents_total / 1200.0))).astype(np.float32)
 
-    # mezcla por velocidad: high aparece más al tocar fuerte
-    w_low  = np.interp(v_norm, [0,1], [0.78, 0.60])
-    w_mid  = np.interp(v_norm, [0,1], [0.40, 0.62])
-    w_high = np.interp(v_norm, [0,1], [0.06, 0.55])
+    # ---- micro-detune fijo por sample (no “chorus”, solo vida) ----
+    det_cents = float(rng_local.uniform(-1.5, 1.5))
+    det = float(2.0 ** (det_cents / 1200.0))
+    f0 = (f0 * det).astype(np.float32)
+
+    # ---- WT scan dependiente de velocity y keytracking ----
+    # (no random): consistente y “más brillante” a más velocidad y más nota
+    pos_low  = float(np.clip(base_pos[0] + 0.08*(v-0.5) + 0.05*(kt-0.5), 0.0, 1.0))
+    pos_mid  = float(np.clip(base_pos[1] + 0.11*(v-0.5) + 0.06*(kt-0.5), 0.0, 1.0))
+    pos_high = float(np.clip(base_pos[2] + 0.16*(v-0.5) + 0.08*(kt-0.5), 0.0, 1.0))
+
+    # ---- 3 capas tipo low/mid/high (armónicos) ----
+    y0 = render_wavetable_osc_f0_array(f0 * 1.0, sr, mip_low,  position=pos_low,  phase0=base_phase[0], mip_strength=base_mip[0])
+    y1 = render_wavetable_osc_f0_array(f0 * 2.0, sr, mip_mid,  position=pos_mid,  phase0=base_phase[1], mip_strength=base_mip[1])
+    y2 = render_wavetable_osc_f0_array(f0 * 4.0, sr, mip_high, position=pos_high, phase0=base_phase[2], mip_strength=base_mip[2])
+
+    # ---- mezcla por velocity + keytracking ----
+    # suave: más low / menos high; fuerte: aparece high + más mid
+    bright = (v**0.65) * (0.85 + 0.30*kt)
+
+    w_low  = np.clip(0.80 - 0.22*bright, 0.40, 0.85)
+    w_mid  = np.clip(0.28 + 0.40*bright, 0.20, 0.75)
+    w_high = np.clip(0.02 + 0.70*(bright**1.20), 0.00, 0.70)
 
     y = (w_low*y0 + w_mid*y1 + w_high*y2).astype(np.float32, copy=False)
 
-    # envolvente + saturación
-    env = adsr_env(n_samples, sr, v_norm)
+    # ---- transient realista (ataque) ----
+    # burst corto de “aire” (diferenciador = highpass barato y vectorizado)
+    noise = rng_local.standard_normal(n).astype(np.float32)
+    hp_noise = (noise - np.concatenate(([0.0], noise[:-1]))).astype(np.float32)  # highpass simple
+    trans_len = int(np.interp(v, [0,1], [0.010, 0.030]) * sr)
+    trans = np.zeros(n, dtype=np.float32)
+    if trans_len > 8:
+        trans_env = exp_decay(t[:trans_len], tau=np.interp(v, [0,1], [0.010, 0.018]))
+        trans[:trans_len] = hp_noise[:trans_len] * trans_env
+    trans_gain = np.interp(v, [0,1], [0.010, 0.060]) * (0.9 + 0.3*kt)
+    y = (y + trans_gain * trans).astype(np.float32, copy=False)
+
+    # ---- ADSR + saturación (más fuerte => más drive) ----
+    env = adsr_env(n, sr, v)
     y = (y * env).astype(np.float32, copy=False)
+
+    drive = np.interp(v, [0,1], [1.10, 2.70]) * (0.95 + 0.25*kt)
     y = sat_tanh(y, drive=drive)
 
-    # aplicar volumen final (sin normalizar por sample => las vel se sienten reales)
+    # ---- “breath/noise floor” (más presente en vel bajas) ----
+    floor = np.interp(v, [0,1], [0.006, 0.0015])
+    y = (y + floor * hp_noise * (env**0.7)).astype(np.float32, copy=False)
+
+    # ---- aplicar volumen final (NO normalizar por archivo) ----
     y = (y * amp * 0.85).astype(np.float32, copy=False)
 
-    # headroom
     return np.clip(y, -1.0, 1.0).astype(np.float32, copy=False)
 
 # =======================
-# Main generation
+# MAIN
 # =======================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wt_dir", required=True, help="Carpeta con wavetables .wav (recursivo)")
+    ap.add_argument("--wt_dir", default=r"D:\WAVETABLE", help="Carpeta con wavetables .wav (recursivo)")
     ap.add_argument("--out_dir", required=True, help="Carpeta de salida")
     ap.add_argument("--seed", type=int, default=0, help="0 = random real, otro = reproducible")
     ap.add_argument("--sr", type=int, default=92000)
@@ -297,84 +335,82 @@ def main():
     ap.add_argument("--bitdepth", default="PCM_24", choices=["PCM_16","PCM_24","PCM_32"])
     ap.add_argument("--vel_layers", type=int, default=25)
 
-    # roots: por defecto EXACTAMENTE 10 roots empezando en C-2 => C-2..C7
-    ap.add_argument("--start_oct", type=int, default=-2, help="Octava de inicio para C (ej: -2)")
-    ap.add_argument("--num_roots", type=int, default=10, help="Cuántos C por octava (ej: 10 => C-2..C7)")
+    # 11 roots: C-2..C8 (inclusive)
+    ap.add_argument("--start_oct", type=int, default=-2)
+    ap.add_argument("--end_oct", type=int, default=8)
 
     args = ap.parse_args()
 
     sr = int(args.sr)
-    n_samples = int(sr * float(args.duration))
-
+    n = int(sr * float(args.duration))
     rng = np.random.default_rng(None if args.seed == 0 else args.seed)
 
     wt_files = list_wav_files(args.wt_dir)
     if len(wt_files) < 3:
-        raise RuntimeError("Necesitas al menos 3 wavetables .wav en --wt_dir")
+        raise RuntimeError(f"Necesitas al menos 3 wavetables .wav en {args.wt_dir}")
 
-    # 3 wavetables fijos (consistentes en todo el set)
-    picks = rng.choice(wt_files, size=3, replace=False).tolist()
-    wt_low, wt_mid, wt_high = picks[0], picks[1], picks[2]
+    # ✅ MISMA SESIÓN = mismos 3 osciladores (3 wavetables) para TODO
+    wt_low, wt_mid, wt_high = rng.choice(wt_files, size=3, replace=False).tolist()
 
-    print("Wavetables (low/mid/high):")
+    print("Wavetables fijos para toda la sesión (low/mid/high):")
     print("  LOW :", os.path.basename(wt_low))
     print("  MID :", os.path.basename(wt_mid))
     print("  HIGH:", os.path.basename(wt_high))
 
-    # cargar mipmaps
     mip_low  = build_wavetable_mipmaps(load_wavetable_wav(wt_low),  levels=WT_MIP_LEVELS)
     mip_mid  = build_wavetable_mipmaps(load_wavetable_wav(wt_mid),  levels=WT_MIP_LEVELS)
     mip_high = build_wavetable_mipmaps(load_wavetable_wav(wt_high), levels=WT_MIP_LEVELS)
 
-    # patch base fijo (consistente)
+    # patch base global (constante para todo el instrumento)
     base_pos   = [float(rng.uniform(0.0, 1.0)) for _ in range(3)]
     base_mip   = [float(rng.uniform(0.65, 1.0)) for _ in range(3)]
     base_phase = [float(rng.uniform(0.0, 1.0)) for _ in range(3)]
 
-    # roots
-    roots = [name_c_oct(args.start_oct + i) for i in range(int(args.num_roots))]
-
-    # vel bins
     vel_bins = velocity_bins(int(args.vel_layers))
 
-    out_dir = args.out_dir
-    samples_dir = os.path.join(out_dir, "Samples")
+    roots = [f"C{o}" for o in range(int(args.start_oct), int(args.end_oct) + 1)]
+    total = len(roots) * len(vel_bins)
+
+    samples_dir = os.path.join(args.out_dir, "Samples")
     os.makedirs(samples_dir, exist_ok=True)
 
-    print(f"Generando: {len(roots)} roots x {len(vel_bins)} vel = {len(roots)*len(vel_bins)} archivos")
+    print(f"Generando {len(roots)} roots (C{args.start_oct}..C{args.end_oct}) x {len(vel_bins)} vel = {total} WAVs")
     print(f"SR={sr}  DUR={args.duration}s  BIT={args.bitdepth}")
 
-    for note in roots:
-        note_hz = note_name_to_hz(note)
+    # para keytracking (0..1): C-2 = 0, C8 = 1
+    kt_den = max(1.0, float(args.end_oct - args.start_oct))
 
-        # subcarpeta por root
+    for note in roots:
+        f0_base = note_name_to_hz(note)
         note_dir = os.path.join(samples_dir, safe_name(note))
         os.makedirs(note_dir, exist_ok=True)
 
+        octv = int(note[1:])  # "C-2" -> "-2"
+        kt = float((octv - args.start_oct) / kt_den)
+
         for vi, (vlo, vhi) in enumerate(vel_bins, start=1):
             v_center = 0.5 * (vlo + vhi)
-            v_norm = float(np.clip(v_center / 127.0, 0.0, 1.0))
+            v = float(np.clip(v_center / 127.0, 0.0, 1.0))
 
-            # RNG local determinístico por nota/vel (si seed != 0)
-            # si seed=0, igual queda random real, pero estable dentro del render de ese sample
-            local_seed = None if args.seed == 0 else (args.seed * 1000003 + hash((note, vi)) % 2_000_000_000)
+            # RNG local: mantiene coherencia por nota/vel si seed != 0
+            local_seed = None if args.seed == 0 else (args.seed * 1000003 + (hash((note, vi)) & 0x7FFFFFFF))
             rng_local = np.random.default_rng(local_seed)
 
             y = synth_one_shot(
                 mip_low, mip_mid, mip_high,
-                note_hz=note_hz,
+                f0_base=f0_base,
                 sr=sr,
-                n_samples=n_samples,
-                v_norm=v_norm,
+                n=n,
+                v=v,
                 base_pos=base_pos,
                 base_mip=base_mip,
                 base_phase=base_phase,
+                note_keytrack=kt,
                 rng_local=rng_local,
             )
 
             fn = f"SYN_{safe_name(note)}_VEL{vi:02d}_({vlo:03d}-{vhi:03d}).wav"
             out_path = os.path.join(note_dir, fn)
-
             sf.write(out_path, y, sr, subtype=args.bitdepth)
             print(f"Wrote {out_path}")
 
@@ -382,4 +418,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
