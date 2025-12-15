@@ -328,7 +328,8 @@ def release_env(n: int, sr: int, v: float) -> np.ndarray:
     return exp_decay(t, tau=tau).astype(np.float32, copy=False)
 
 # ==========================================
-# Looping con crossfade
+# Looping con crossfade (NO se usa en Option B)
+# Se deja por si quieres usarlo en el futuro desde el sampler/otro modo.
 # ==========================================
 def apply_loop_crossfade(y: np.ndarray, sr: int, loop_start_s: float, loop_end_s: float, xfade_s: float) -> np.ndarray:
     y = np.asarray(y, dtype=np.float32)
@@ -765,6 +766,7 @@ def render_instrument(
     log(f"Velocity fija: {vel_midi} (v={v:.3f}) | SR={sr} | DUR={duration}s | BIT={bitdepth}")
     log(f"OUT: {out_dir}")
     log(f"File prefix: {prefix}")
+    log("Loop crossfade: OFF (one-shot corrido; setea loop en tu sampler)")
 
     for note in roots:
         if cancel_check and cancel_check():
@@ -806,12 +808,11 @@ def render_instrument(
                 mip_smooth_tau=float(mip_smooth_tau),
             )
 
-            y = apply_loop_crossfade(
-                y, sr=int(sr),
-                loop_start_s=float(loop_start),
-                loop_end_s=float(loop_end),
-                xfade_s=float(loop_xfade),
-            )
+            # ==========================================================
+            # OPTION B: WAV 100% corrido “one-shot”
+            # NO aplicamos apply_loop_crossfade() aquí para evitar cortes.
+            # (El loop lo setéas en el sampler)
+            # ==========================================================
 
             if bits is not None:
                 y = add_tpdf_dither(y, bits=bits, rng=rng_noise)
@@ -979,7 +980,7 @@ def launch_gui():
             self.release_time.setEnabled(False)
             grid.addWidget(self.release_time, 8, 1)
 
-            # loop start/end/xfade
+            # loop start/end/xfade (se mantienen en UI aunque el render no aplica crossfade)
             grid.addWidget(QLabel("Loop start / end / xfade (s):"), 9, 0)
             row = QHBoxLayout()
             self.loop_start = QDoubleSpinBox(); self.loop_start.setDecimals(3); self.loop_start.setRange(0.0, 60.0); self.loop_start.setValue(1.0)
@@ -1188,3 +1189,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
