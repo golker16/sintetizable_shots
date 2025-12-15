@@ -1,4 +1,4 @@
-import os, glob, math, argparse
+import os, glob, math, argparse, sys
 import numpy as np
 import soundfile as sf
 
@@ -108,7 +108,6 @@ def _table_read_cubic_hermite(table_1d: np.ndarray, phase: np.ndarray) -> np.nda
     p2 = table_1d[i2]
     p3 = table_1d[i3]
 
-    # Catmull-Rom spline
     a = (-0.5 * p0) + (1.5 * p1) - (1.5 * p2) + (0.5 * p3)
     b = (p0) - (2.5 * p1) + (2.0 * p2) - (0.5 * p3)
     c = (-0.5 * p0) + (0.5 * p2)
@@ -130,14 +129,6 @@ def render_wavetable_osc_f0_array(
     block_size: int = 256,
     mip_smooth_tau: float = 0.030,
 ):
-    """
-    Osc wavetable con:
-      - phase vectorizada
-      - mip-blend por bloques (rápido)
-      - derivative mip (usa inc = f0/sr; en práctica equivale a f0 pero respeta armónicos)
-      - smoothing 1-pole en el dominio de bloques para evitar zipper
-      - lectura cubic Hermite
-    """
     f0_hz = np.asarray(f0_hz, dtype=np.float32)
     n = int(len(f0_hz))
     if n == 0:
@@ -160,46 +151,37 @@ def render_wavetable_osc_f0_array(
     n_levels = len(mipmaps)
     out = np.zeros(n, dtype=np.float32)
 
-    # derivative mip reference in cycles/sample
     inc_ref = max(55.0 / float(sr), 1e-12)
     ms = float(np.clip(mip_strength, 0.0, 1.0))
 
-    # bloqueado
     bs = int(max(16, block_size))
     nb = int((n + bs - 1) // bs)
 
-    # smoothing coefficient for block-domain one-pole
     tau = float(max(1e-6, mip_smooth_tau))
-    g = 1.0 - math.exp(-float(bs) / (tau * float(sr)))  # 0..1
+    g = 1.0 - math.exp(-float(bs) / (tau * float(sr)))
 
     lvl_sm = None
-
-    # Precompute per-level tables (for just-in-time use)
-    # We'll build them on demand and cache.
     table_cache: dict[int, np.ndarray] = {}
 
     for bi in range(nb):
         i = bi * bs
         j = min(n, i + bs)
 
-        inc_blk = float(np.max(inc[i:j]) + 1e-12)  # peak safer than mean
+        inc_blk = float(np.max(inc[i:j]) + 1e-12)
         ratio = max(inc_blk / inc_ref, 1e-6)
         lvl = (math.log2(ratio) * ms)
 
-        # 1-pole smoothing across blocks (avoid zipper during vibrato/pitch env)
         if lvl_sm is None:
             lvl_sm = lvl
         else:
             lvl_sm = lvl_sm + g * (lvl - lvl_sm)
 
-        # mip crossfade within block (constant frac per block)
         L0 = int(np.clip(math.floor(lvl_sm), 0, n_levels - 1))
         frac = float(np.clip(lvl_sm - float(L0), 0.0, 1.0))
         L1 = int(min(L0 + 1, n_levels - 1))
 
         ph = phase[i:j]
 
-        # tables per level (position-lerped once per level)
         if L0 not in table_cache:
             tables_L0 = mipmaps[L0]
             table_cache[L0] = _lerp(tables_L0[f0i], tables_L0[f1i], ft).astype(np.float32, copy=False)
@@ -235,7 +217,7 @@ def note_name_to_hz(note: str) -> float:
         raise ValueError(f"Nota inválida: {note}")
     octv = int(oct_str)
     semitone = NOTE_NAMES.index(nn)
-    midi = (octv + 1) * 12 + semitone  # C-1 = 0
+    midi = (octv + 1) * 12 + semitone
     hz = 440.0 * (2.0 ** ((midi - 69) / 12.0))
     return float(hz)
 
@@ -290,14 +272,12 @@ def _bits_for_subtype(subtype: str) -> int | None:
         return 24
     if st == "PCM_32":
         return 32
-    # FLOAT/DOUBLE -> no dither
     return None
 
 # ==========================================
 # Humanize determinístico
 # ==========================================
 def stable_hash32(s: str) -> int:
-    # FNV-1a 32-bit
     h = 2166136261
     for b in s.encode("utf-8"):
         h ^= b
@@ -312,9 +292,6 @@ def hash_float01(a: int) -> float:
 # ADSR helpers (sustain-only + release-only)
 # ==========================================
 def adsr_sustain_env(n: int, sr: int, v: float) -> np.ndarray:
-    """
-    Envelope para el sample "sustain/loop": ataque + decay -> sustain y se queda en sustain.
-    """
     v = float(np.clip(v, 0.0, 1.0))
     atk = np.interp(v, [0.0, 1.0], [0.120, 0.004])
     dec = np.interp(v, [0.0, 1.0], [1.40, 0.45])
@@ -338,18 +315,13 @@ def adsr_sustain_env(n: int, sr: int, v: float) -> np.ndarray:
     return env
 
 def release_env(n: int, sr: int, v: float) -> np.ndarray:
-    """
-    Release-only envelope (key-off tail): parte de 1 y cae a 0.
-    """
     v = float(np.clip(v, 0.0, 1.0))
-    # suave: más largo; fuerte: más corto
     tau = float(np.interp(v, [0.0, 1.0], [2.2, 1.2]))
     t = (np.arange(n, dtype=np.float32) / float(sr))
-    env = exp_decay(t, tau=tau)
-    return env.astype(np.float32, copy=False)
+    return exp_decay(t, tau=tau).astype(np.float32, copy=False)
 
 # ==========================================
-# (7) Looping con crossfade (para loop estable)
+# Looping con crossfade
 # ==========================================
 def apply_loop_crossfade(y: np.ndarray, sr: int, loop_start_s: float, loop_end_s: float, xfade_s: float) -> np.ndarray:
     y = np.asarray(y, dtype=np.float32)
@@ -362,31 +334,23 @@ def apply_loop_crossfade(y: np.ndarray, sr: int, loop_start_s: float, loop_end_s
     if le <= ls + xf + 8:
         return y
 
-    # segmentos
     A = y[ls:ls+xf].copy()
     B = y[le-xf:le].copy()
 
     fade = np.linspace(0.0, 1.0, xf, endpoint=False, dtype=np.float32)
     cross = (B * (1.0 - fade) + A * fade).astype(np.float32)
 
-    # hacemos que inicio/fin del loop coincidan exactamente
     y2 = y.copy()
     y2[ls:ls+xf] = cross
     y2[le-xf:le] = cross
     return y2
 
 # ==========================================
-# (9) “Formant / body EQ” cheap FIR-style (no scipy)
-#     - body: boost suave 200–600 Hz aprox con (lp_fast - lp_slow)
-#     - highs: shelf down en registros altos (kt) con lowpass-substract trick
+# Body EQ barato
 # ==========================================
 def cheap_body_eq(y: np.ndarray, sr: int, kt: float, v: float) -> np.ndarray:
-    """
-    EQ barato FIR-ish (convoluciones cortas). No es un biquad real, pero da "cuerpo" sin loops Python.
-    """
     y = np.asarray(y, dtype=np.float32)
 
-    # tamaño de ventanas (en samples) - muy pequeñas para rendimiento
     k_fast = int(np.clip(np.interp(kt, [0,1], [9, 5]), 5, 21))
     k_slow = int(np.clip(np.interp(kt, [0,1], [61, 33]), 21, 129))
 
@@ -398,30 +362,21 @@ def cheap_body_eq(y: np.ndarray, sr: int, kt: float, v: float) -> np.ndarray:
 
     band = (lp_fast - lp_slow).astype(np.float32, copy=False)
 
-    # body gain: más en vel bajas/medias; menos en hard
     body_g = float(np.interp(v, [0,1], [0.22, 0.08]))
     y2 = (y + body_g * band).astype(np.float32, copy=False)
 
-    # high shelf down en C7/C8 (kt alto): atenuar "edge"
-    # aproximación: quitar un poco de high (y - lowpass)
     k_hp = int(np.clip(np.interp(kt, [0,1], [15, 33]), 9, 65))
     w_hp = np.ones(k_hp, dtype=np.float32) / float(k_hp)
     low = np.convolve(y2, w_hp, mode="same").astype(np.float32, copy=False)
     high = (y2 - low).astype(np.float32, copy=False)
 
     shelf = float(np.interp(kt, [0,1], [1.0, 0.78]))
-    y3 = (low + shelf * high).astype(np.float32, copy=False)
-
-    return y3
+    return (low + shelf * high).astype(np.float32, copy=False)
 
 # ==========================================
-# (10) Transient bandpass keytracked (ataque noise más natural)
+# Bandpass noise keytracked
 # ==========================================
 def bandpass_noise_keytracked(hp_noise: np.ndarray, sr: int, kt: float) -> np.ndarray:
-    """
-    Bandpass barato: (lp_fast - lp_slow) sobre el ruido highpassed.
-    kt alto -> banda más alta (ventanas más cortas).
-    """
     hp_noise = np.asarray(hp_noise, dtype=np.float32)
 
     k_fast = int(np.clip(np.interp(kt, [0,1], [13, 5]), 5, 25))
@@ -452,36 +407,23 @@ def synth_sustain_one_shot(
     mip_block: int,
     mip_smooth_tau: float,
 ):
-    """
-    Render de sustain/loop (sin release final). Devuelve (y, phase_end_low, phase_end_mid, phase_end_high).
-    """
     v = float(np.clip(v, 0.0, 1.0))
     kt = float(np.clip(note_keytrack, 0.0, 1.0))
     t = (np.arange(n, dtype=np.float32) / float(sr))
 
-    # =======================
-    # (8) Dinámica más musical: curva con knee
-    # =======================
-    # knee aprox vel~90 => v~0.71
     knee = 0.71
     knee_part = float(np.clip((v - knee) / max(1e-6, (1.0 - knee)), 0.0, 1.0))
 
-    # gain: soft sube lento, medio sube rápido, hard "satura"
     v_curve = v ** 1.45
     amp_db = np.interp(v_curve, [0.0, 0.75, 1.0], [-34.0, -12.5, -9.5])
-    # en hard, un pelín menos ganancia (más real), pero más timbre
     amp_db -= 1.5 * knee_part
     amp = db_to_lin(float(amp_db))
 
-    # =======================
-    # Pitch env + vibrato (RR: variamos fase)
-    # =======================
     pitch_attack_cents = (2.0 + 10.0*(v**0.9)) * (1.0 + 0.25*kt)
     pitch_env = pitch_attack_cents * exp_decay(t, tau=np.interp(v, [0,1], [0.075, 0.040]))
 
     vib_rate = np.interp(v, [0,1], [4.2, 5.6])
     vib_depth_cents = np.interp(v, [0,1], [0.2, 1.2]) * (1.0 + 0.15*knee_part)
-    # RR: fase de vibrato distinta
     h_vib = stable_hash32(f"{note_name}|{vel_index}|RR{rr_index}|VIBPH")
     vib_phase = 2.0 * np.pi * hash_float01(h_vib)
     vibrato = vib_depth_cents * np.sin(2.0*np.pi*vib_rate*t + vib_phase).astype(np.float32)
@@ -489,11 +431,8 @@ def synth_sustain_one_shot(
     cents_total = (pitch_env + vibrato).astype(np.float32)
     f0 = (f0_base * (2.0 ** (cents_total / 1200.0))).astype(np.float32)
 
-    # =======================
-    # Detune “real” por oscilador (RR influye un poco)
-    # =======================
     h = stable_hash32(f"{note_name}|{vel_index}|RR{rr_index}|{int(kt*1000)}|{int(v*10000)}")
-    base_det = (hash_float01(h) * 2.0 - 1.0)  # -1..1
+    base_det = (hash_float01(h) * 2.0 - 1.0)
 
     det_low_c  = 0.30 * base_det
     det_mid_c  = 0.90 * base_det + 0.35
@@ -508,14 +447,10 @@ def synth_sustain_one_shot(
     f0_mid  = (f0 * (2.0 ** (det_mid_c  / 1200.0))).astype(np.float32)
     f0_high = (f0 * (2.0 ** (det_high_c / 1200.0))).astype(np.float32)
 
-    # WT scan dependiente de velocity y keytracking
     pos_low  = float(np.clip(base_pos[0] + 0.08*(v-0.5) + 0.05*(kt-0.5), 0.0, 1.0))
     pos_mid  = float(np.clip(base_pos[1] + 0.11*(v-0.5) + 0.06*(kt-0.5), 0.0, 1.0))
     pos_high = float(np.clip(base_pos[2] + 0.16*(v-0.5) + 0.08*(kt-0.5), 0.0, 1.0))
 
-    # =======================
-    # (5) Round-robins: fase inicial por oscilador distinta
-    # =======================
     ph_off0 = hash_float01(stable_hash32(f"{note_name}|{vel_index}|RR{rr_index}|PH0")) * 0.25
     ph_off1 = hash_float01(stable_hash32(f"{note_name}|{vel_index}|RR{rr_index}|PH1")) * 0.25
     ph_off2 = hash_float01(stable_hash32(f"{note_name}|{vel_index}|RR{rr_index}|PH2")) * 0.25
@@ -523,7 +458,6 @@ def synth_sustain_one_shot(
     ph1 = float((base_phase[1] + ph_off1) % 1.0)
     ph2 = float((base_phase[2] + ph_off2) % 1.0)
 
-    # 3 capas low/mid/high (armónicos) -> derivative mip + cubic + blocks
     y0 = render_wavetable_osc_f0_array(
         f0_low * 1.0, sr, mip_low,
         position=pos_low, phase0=ph0, mip_strength=base_mip[0],
@@ -540,66 +474,50 @@ def synth_sustain_one_shot(
         block_size=mip_block, mip_smooth_tau=mip_smooth_tau,
     )
 
-    # phases end (para release)
     phase_end_low  = float((ph0 + float(np.sum((f0_low  * 1.0) / float(sr), dtype=np.float64))) % 1.0)
     phase_end_mid  = float((ph1 + float(np.sum((f0_mid  * 2.0) / float(sr), dtype=np.float64))) % 1.0)
     phase_end_high = float((ph2 + float(np.sum((f0_high * 4.0) / float(sr), dtype=np.float64))) % 1.0)
 
-    # mezcla base
     bright = (v**0.65) * (0.85 + 0.30*kt)
     w_low  = float(np.clip(0.80 - 0.22*bright, 0.40, 0.85))
     w_mid  = float(np.clip(0.28 + 0.40*bright, 0.20, 0.75))
     w_high = float(np.clip(0.02 + 0.70*(bright**1.20), 0.00, 0.70))
 
-    # =======================
-    # Filter envelope + registro + knee (hard: más timbre)
-    # =======================
     fenv_amt = np.interp(v, [0,1], [0.20, 0.85]) * (0.8 + 0.3*kt)
-    fenv_amt *= (1.0 - 0.20*kt)         # menos snap en agudos
-    fenv_amt *= (1.0 + 0.20*knee_part)  # hard: más timbre
+    fenv_amt *= (1.0 - 0.20*kt)
+    fenv_amt *= (1.0 + 0.20*knee_part)
     fenv = (fenv_amt * exp_decay(t, tau=np.interp(v, [0,1], [0.20, 0.08]))).astype(np.float32)
 
     w_high_t = np.clip(w_high + 0.35 * fenv, 0.0, 0.9).astype(np.float32)
     w_mid_t  = np.clip(w_mid  + 0.10 * fenv, 0.0, 0.9).astype(np.float32)
     w_low_t  = np.clip(w_low  - 0.12 * fenv, 0.0, 0.9).astype(np.float32)
 
-    # =======================
-    # Micro-movimiento tímbrico determinístico (RR afecta fase)
-    # =======================
     h2 = stable_hash32(f"{note_name}|{vel_index}|RR{rr_index}|LFO")
     rate = np.interp(hash_float01(h2), [0,1], [0.18, 0.55])
     phase_lfo = 2.0 * np.pi * hash_float01(h2 ^ 0xA5A5A5A5)
     lfo = np.sin(2.0*np.pi*rate*t + phase_lfo).astype(np.float32)
 
     depth = np.interp(v, [0,1], [0.06, 0.015]) * (0.85 + 0.25*kt)
-    # más audible en soft, y se “apoya” en el envelope
     env_sus = adsr_sustain_env(n, sr, v)
     mod = (1.0 + depth * lfo * (env_sus**0.55)).astype(np.float32)
 
     y1 = (y1 * mod).astype(np.float32, copy=False)
     y2 = (y2 * (1.0 + 0.5*depth*lfo*(env_sus**0.55))).astype(np.float32, copy=False)
 
-    # mezcla final
     y = (w_low_t*y0 + w_mid_t*y1 + w_high_t*y2).astype(np.float32, copy=False)
 
-    # =======================
-    # Transients: noise + click + bandpass keytracked (más natural)
-    # =======================
     noise = rng_noise.standard_normal(n).astype(np.float32)
     hp_noise = (noise - np.concatenate(([0.0], noise[:-1]))).astype(np.float32)
-
     bp_noise = bandpass_noise_keytracked(hp_noise, sr=sr, kt=kt)
 
     trans_len = int(np.interp(v, [0,1], [0.010, 0.030]) * sr)
     trans = np.zeros(n, dtype=np.float32)
     if trans_len > 8:
         trans_env = exp_decay(t[:trans_len], tau=np.interp(v, [0,1], [0.010, 0.018]))
-        # energía depende de fenv (ataque real)
         trans[:trans_len] = bp_noise[:trans_len] * trans_env * (0.7 + 0.9*fenv[:trans_len])
     trans_gain = np.interp(v, [0,1], [0.010, 0.060]) * (0.9 + 0.3*kt)
     y = (y + trans_gain * trans).astype(np.float32, copy=False)
 
-    # click corto band-limited keytracked
     click_len = int(np.interp(v, [0,1], [0.0015, 0.0030]) * sr)
     if click_len > 8:
         click_env = exp_decay(t[:click_len], tau=np.interp(v, [0,1], [0.0008, 0.0016]))
@@ -607,47 +525,31 @@ def synth_sustain_one_shot(
         click[:click_len] = click_env
 
         click_hp = click - np.concatenate(([0.0], click[:-1]))
-
-        # keytracked "band-limit" (ventanas más cortas en agudos)
         k = int(np.clip(np.interp(kt, [0,1], [13, 7]), 5, 21))
         click_lp = np.convolve(click_hp, np.ones(k, dtype=np.float32)/k, mode="same").astype(np.float32)
 
         click_gain = np.interp(v, [0,1], [0.020, 0.090]) * (0.8 + 0.35*kt)
         y = (y + click_gain * click_lp * (0.7 + 0.9*fenv)).astype(np.float32, copy=False)
 
-    # =======================
-    # Apply sustain envelope (attack/decay->sustain; sin release)
-    # =======================
     y = (y * env_sus).astype(np.float32, copy=False)
 
-    # =======================
-    # Saturación: con compensación por registro + knee
-    # =======================
     drive_base = np.interp(v, [0,1], [1.10, 2.70])
-    drive_base *= (1.05 - 0.25*kt)      # menos drive en notas altas
-    drive_base *= (0.95 + 0.15*kt)      # pero no lo mates
-    drive_base *= (1.0 + 0.12*knee_part)  # hard: un poco más drive (sin gritar por kt)
+    drive_base *= (1.05 - 0.25*kt)
+    drive_base *= (0.95 + 0.15*kt)
+    drive_base *= (1.0 + 0.12*knee_part)
     drive_env = (drive_base * (1.0 + 0.90 * fenv)).astype(np.float32)
     y = np.tanh(drive_env * y).astype(np.float32, copy=False)
 
-    # “breath/noise floor” (más presente en vel bajas)
     floor = np.interp(v, [0,1], [0.006, 0.0015])
     y = (y + floor * bp_noise * (env_sus**0.7)).astype(np.float32, copy=False)
 
-    # =======================
-    # (9) Body EQ keytracked (barato)
-    # =======================
     y = cheap_body_eq(y, sr=sr, kt=kt, v=v)
 
-    # =======================
-    # Gain staging por RMS (antes del amp final)
-    # =======================
     rms = float(np.sqrt(np.mean(y*y) + 1e-12))
     target_rms = db_to_lin(np.interp(v**1.35, [0,1], [-28.0, -10.0]))
     corr = float(np.clip(target_rms / (rms + 1e-12), 0.5, 1.8))
     y = (y * corr).astype(np.float32, copy=False)
 
-    # volumen final
     y = (y * amp * 0.85).astype(np.float32, copy=False)
 
     return np.clip(y, -1.0, 1.0).astype(np.float32, copy=False), phase_end_low, phase_end_mid, phase_end_high
@@ -670,14 +572,10 @@ def synth_release_tail(
     mip_block: int,
     mip_smooth_tau: float,
 ):
-    """
-    Release sample: tail con envelope largo, menos brillo/drive.
-    """
     v = float(np.clip(v, 0.0, 1.0))
     kt = float(np.clip(note_keytrack, 0.0, 1.0))
     t = (np.arange(n, dtype=np.float32) / float(sr))
 
-    # f0 release: más estable, menos vibrato
     vib_rate = np.interp(v, [0,1], [3.8, 5.0])
     vib_depth_cents = np.interp(v, [0,1], [0.10, 0.55])
     h_vib = stable_hash32(f"{note_name}|{vel_index}|RR{rr_index}|REL|VIBPH")
@@ -685,7 +583,6 @@ def synth_release_tail(
     vibrato = vib_depth_cents * np.sin(2.0*np.pi*vib_rate*t + vib_phase).astype(np.float32)
     f0 = (f0_base * (2.0 ** (vibrato / 1200.0))).astype(np.float32)
 
-    # detune por osc igual que sustain (para continuidad tímbrica)
     h = stable_hash32(f"{note_name}|{vel_index}|RR{rr_index}|REL|{int(kt*1000)}|{int(v*10000)}")
     base_det = (hash_float01(h) * 2.0 - 1.0)
 
@@ -693,7 +590,7 @@ def synth_release_tail(
     det_mid_c  = 0.90 * base_det + 0.35
     det_high_c = 1.30 * base_det - 0.55
 
-    spread = np.interp(v, [0,1], [0.85, 1.10])  # un poco menos spread en release
+    spread = np.interp(v, [0,1], [0.85, 1.10])
     det_low_c  *= spread
     det_mid_c  *= spread
     det_high_c *= spread
@@ -702,18 +599,15 @@ def synth_release_tail(
     f0_mid  = (f0 * (2.0 ** (det_mid_c  / 1200.0))).astype(np.float32)
     f0_high = (f0 * (2.0 ** (det_high_c / 1200.0))).astype(np.float32)
 
-    # posiciones iguales (coherencia)
     pos_low  = float(np.clip(base_pos[0] + 0.08*(v-0.5) + 0.05*(kt-0.5), 0.0, 1.0))
     pos_mid  = float(np.clip(base_pos[1] + 0.11*(v-0.5) + 0.06*(kt-0.5), 0.0, 1.0))
     pos_high = float(np.clip(base_pos[2] + 0.16*(v-0.5) + 0.08*(kt-0.5), 0.0, 1.0))
 
-    # menos brillo en release
     bright = (v**0.65) * (0.85 + 0.30*kt)
     w_low  = float(np.clip(0.82 - 0.18*bright, 0.45, 0.88))
     w_mid  = float(np.clip(0.28 + 0.28*bright, 0.20, 0.70))
     w_high = float(np.clip(0.02 + 0.35*(bright**1.10), 0.00, 0.40))
 
-    # fenv muy suave en release
     fenv_amt = np.interp(v, [0,1], [0.08, 0.22]) * (0.9 - 0.2*kt)
     fenv = (fenv_amt * exp_decay(t, tau=np.interp(v, [0,1], [0.35, 0.18]))).astype(np.float32)
 
@@ -721,7 +615,6 @@ def synth_release_tail(
     w_mid_t  = np.clip(w_mid  + 0.05 * fenv, 0.0, 0.80).astype(np.float32)
     w_low_t  = np.clip(w_low  - 0.05 * fenv, 0.0, 0.95).astype(np.float32)
 
-    # render con phase0 de continuidad
     y0 = render_wavetable_osc_f0_array(
         f0_low * 1.0, sr, mip_low, position=pos_low,
         phase0=float(phase0_low), mip_strength=base_mip[0],
@@ -740,24 +633,20 @@ def synth_release_tail(
 
     y = (w_low_t*y0 + w_mid_t*y1 + w_high_t*y2).astype(np.float32, copy=False)
 
-    # release env
     env_rel = release_env(n, sr, v)
     y = (y * env_rel).astype(np.float32, copy=False)
 
-    # ruido sutil en release
     noise = rng_noise.standard_normal(n).astype(np.float32)
     hp_noise = (noise - np.concatenate(([0.0], noise[:-1]))).astype(np.float32)
     bp_noise = bandpass_noise_keytracked(hp_noise, sr=sr, kt=kt)
     floor = np.interp(v, [0,1], [0.0045, 0.0012])
     y = (y + floor * bp_noise * (env_rel**0.85)).astype(np.float32, copy=False)
 
-    # drive menor en release
     drive_base = np.interp(v, [0,1], [1.05, 1.85])
     drive_base *= (1.05 - 0.30*kt)
     drive_env = (drive_base * (1.0 + 0.35 * fenv)).astype(np.float32)
     y = np.tanh(drive_env * y).astype(np.float32, copy=False)
 
-    # EQ body
     y = cheap_body_eq(y, sr=sr, kt=kt, v=v)
 
     return np.clip(y, -1.0, 1.0).astype(np.float32, copy=False)
@@ -768,46 +657,44 @@ def synth_release_tail(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wt_dir", default=r"D:\WAVETABLE", help="Carpeta con wavetables .wav (recursivo)")
-    ap.add_argument("--out_dir", required=True, help="Carpeta de salida")
+
+    # ✅ CAMBIO: out_dir ya NO es required (para EXE --windowed/GUI)
+    ap.add_argument("--out_dir", default=None, help="Carpeta de salida (si None, se auto-elige)")
+
     ap.add_argument("--seed", type=int, default=0, help="0 = random real (elige wavetables/patch distinto), otro = reproducible")
 
     ap.add_argument("--sr", type=int, default=92000)
-
-    # sustain length (antes era duration)
     ap.add_argument("--duration", type=float, default=15.0, help="Duración del sample principal (sustain/loop)")
-
-    # (6) release tail separado
     ap.add_argument("--release_time", type=float, default=4.0, help="Duración del sample release (0 desactiva)")
 
-    # (7) loop
     ap.add_argument("--loop_start", type=float, default=1.0)
     ap.add_argument("--loop_end", type=float, default=4.0)
     ap.add_argument("--loop_xfade", type=float, default=0.12)
 
-    # recomendado para DecentSampler: FLOAT (32-bit float)
     ap.add_argument("--bitdepth", default="FLOAT", choices=["PCM_16","PCM_24","PCM_32","FLOAT"])
     ap.add_argument("--vel_layers", type=int, default=25)
     ap.add_argument("--vel_curve", type=float, default=2.2)
 
-    # roots
     ap.add_argument("--start_oct", type=int, default=-2)
     ap.add_argument("--end_oct", type=int, default=8)
 
-    # (2)(3) mip options
     ap.add_argument("--mip_block", type=int, default=256, help="Tamaño de bloque para mip-blend (128-512 típico)")
     ap.add_argument("--mip_smooth_tau", type=float, default=0.030, help="Tau smoothing para mip-level (segundos)")
 
-    # (5) Round robins
     ap.add_argument("--round_robins", type=int, default=3, help="Cantidad de RR por (nota, vel) (1-4 típico)")
 
     args = ap.parse_args()
+
+    # ✅ CAMBIO: fallback automático si no pasas --out_dir
+    if args.out_dir is None:
+        base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.getcwd()
+        args.out_dir = os.path.join(base, "Output")
 
     sr = int(args.sr)
     n_sus = int(sr * float(args.duration))
     n_rel = int(sr * float(max(0.0, args.release_time)))
 
     rrN = int(max(1, args.round_robins))
-
     rng = np.random.default_rng(None if args.seed == 0 else args.seed)
 
     wt_files = list_wav_files(args.wt_dir)
@@ -840,6 +727,7 @@ def main():
     print(f"Generando {len(roots)} roots x {len(vel_bins)} vel x {rrN} RR = {total} WAVs (+ release si aplica)")
     print(f"SR={sr}  SUS={args.duration}s  REL={args.release_time}s  BIT={args.bitdepth}")
     print(f"Loop: start={args.loop_start}s end={args.loop_end}s xfade={args.loop_xfade}s (se aplica al sample principal)")
+    print(f"OUT: {args.out_dir}")
 
     kt_den = max(1.0, float(args.end_oct - args.start_oct))
 
@@ -865,7 +753,6 @@ def main():
             v = float(np.clip(v_center / 127.0, 0.0, 1.0))
 
             for rri in range(1, rrN + 1):
-                # seed estable por muestra + RR (noise/transient/release)
                 seed_noise = stable_hash32(f"{session_tag}|{note}|{vi}|RR{rri}|noise") & 0x7FFFFFFF
                 rng_noise = np.random.default_rng(int(seed_noise))
 
@@ -887,7 +774,6 @@ def main():
                     mip_smooth_tau=float(args.mip_smooth_tau),
                 )
 
-                # (7) loop crossfade baked-in (para loop estable)
                 y = apply_loop_crossfade(
                     y, sr=sr,
                     loop_start_s=float(args.loop_start),
@@ -895,7 +781,6 @@ def main():
                     xfade_s=float(args.loop_xfade),
                 )
 
-                # dither solo si exportas PCM_*
                 if bits is not None:
                     y = add_tpdf_dither(y, bits=bits, rng=rng_noise)
 
@@ -904,7 +789,6 @@ def main():
                 sf.write(out_path, y, sr, subtype=args.bitdepth)
                 print(f"Wrote {out_path}")
 
-                # (6) release tail separado
                 if n_rel > 0:
                     seed_rel = stable_hash32(f"{session_tag}|{note}|{vi}|RR{rri}|release_noise") & 0x7FFFFFFF
                     rng_rel = np.random.default_rng(int(seed_rel))
