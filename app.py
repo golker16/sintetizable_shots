@@ -1,4 +1,5 @@
 import os, glob, math, argparse, sys, traceback
+import re, unicodedata
 import numpy as np
 import soundfile as sf
 
@@ -244,6 +245,17 @@ def list_wav_files(folder: str):
 
 def safe_name(s: str) -> str:
     return s.replace("#","s").replace("-","m")
+
+def compact_token_from_filename(path: str) -> str:
+    # basename sin extensión
+    s = os.path.splitext(os.path.basename(path))[0]
+    # quita acentos / caracteres raros → ascii
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")
+    s = s.lower()
+    # solo letras/números, todo junto
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
 
 def db_to_lin(db: float) -> float:
     return float(10.0 ** (db / 20.0))
@@ -704,6 +716,15 @@ def render_instrument(
     log(f"  MID : {os.path.basename(wt_mid)}")
     log(f"  HIGH: {os.path.basename(wt_high)}")
 
+    # Prefijo con los nombres de las wavetables (compacto, sin espacios, minusculas)
+    prefix = (
+        compact_token_from_filename(wt_low)
+        + compact_token_from_filename(wt_mid)
+        + compact_token_from_filename(wt_high)
+    )
+    if not prefix:
+        prefix = "wavetables"
+
     mip_low  = build_wavetable_mipmaps(load_wavetable_wav(wt_low),  levels=WT_MIP_LEVELS)
     mip_mid  = build_wavetable_mipmaps(load_wavetable_wav(wt_mid),  levels=WT_MIP_LEVELS)
     mip_high = build_wavetable_mipmaps(load_wavetable_wav(wt_high), levels=WT_MIP_LEVELS)
@@ -712,11 +733,16 @@ def render_instrument(
     base_mip   = [float(rng.uniform(0.65, 1.0)) for _ in range(3)]
     base_phase = [float(rng.uniform(0.0, 1.0)) for _ in range(3)]
 
-    roots = [f"C{o}" for o in range(int(start_oct), int(end_oct) + 1)]
-    rrN = int(max(1, round_robins))
+    # 22 roots: C y F# por octava
+    roots = []
+    for o in range(int(start_oct), int(end_oct) + 1):
+        roots.append(f"C{o}")
+        roots.append(f"F#{o}")
+
+    rrN = 1  # exacto 22 archivos
 
     n_sus = int(int(sr) * float(duration))
-    n_rel = int(int(sr) * float(max(0.0, release_time)))
+    n_rel = 0  # fuerza release off para no duplicar archivos
 
     samples_dir = os.path.join(out_dir, "Samples")
     os.makedirs(samples_dir, exist_ok=True)
@@ -732,12 +758,13 @@ def render_instrument(
         f"{base_phase[0]:.4f},{base_phase[1]:.4f},{base_phase[2]:.4f}|VEL{vel_midi}"
     )
 
-    total = len(roots) * rrN * (1 + (1 if n_rel > 0 else 0))
+    total = len(roots) * rrN
     done = 0
 
-    log(f"Generando {len(roots)} roots (C{start_oct}..C{end_oct}) x {rrN} RR = {len(roots)*rrN} WAVs (+REL={n_rel>0})")
+    log(f"Generando roots (C y F# por octava): {len(roots)} WAVs (C{start_oct}..C{end_oct} y F#{start_oct}..F#{end_oct})")
     log(f"Velocity fija: {vel_midi} (v={v:.3f}) | SR={sr} | DUR={duration}s | BIT={bitdepth}")
     log(f"OUT: {out_dir}")
+    log(f"File prefix: {prefix}")
 
     for note in roots:
         if cancel_check and cancel_check():
@@ -745,10 +772,12 @@ def render_instrument(
             break
 
         f0_base = note_name_to_hz(note)
-        note_dir = os.path.join(samples_dir, safe_name(note))
-        os.makedirs(note_dir, exist_ok=True)
 
-        octv = int(note[1:])
+        # keytrack por octava (C-2 y F#-2 comparten octava -2)
+        if "F#" in note:
+            octv = int(note[2:])
+        else:
+            octv = int(note[1:])
         kt = float((octv - start_oct) / kt_den)
 
         for rri in range(1, rrN + 1):
@@ -759,7 +788,7 @@ def render_instrument(
             seed_noise = stable_hash32(f"{session_tag}|{note}|VEL{vel_midi}|RR{rri}|noise") & 0x7FFFFFFF
             rng_noise = np.random.default_rng(int(seed_noise))
 
-            y, ph_end0, ph_end1, ph_end2 = synth_sustain_one_shot(
+            y, _ph_end0, _ph_end1, _ph_end2 = synth_sustain_one_shot(
                 mip_low, mip_mid, mip_high,
                 f0_base=f0_base,
                 sr=int(sr),
@@ -787,54 +816,15 @@ def render_instrument(
             if bits is not None:
                 y = add_tpdf_dither(y, bits=bits, rng=rng_noise)
 
-            fn = f"SYN_{safe_name(note)}_VEL{vel_midi:03d}_RR{rri:02d}.wav"
-            out_path = os.path.join(note_dir, fn)
+            # todo a la misma carpeta (samples_dir)
+            fn = f"{prefix}_{note}.wav"   # ej: nombreejemplo_C3.wav / nombreejemplo_F#3.wav
+            out_path = os.path.join(samples_dir, fn)
             sf.write(out_path, y, int(sr), subtype=bitdepth)
             log(f"Wrote {out_path}")
 
             done += 1
             if progress_fn:
                 progress_fn(done, total)
-
-            if n_rel > 0:
-                if cancel_check and cancel_check():
-                    log("Cancelado por el usuario.")
-                    break
-
-                seed_rel = stable_hash32(f"{session_tag}|{note}|VEL{vel_midi}|RR{rri}|release_noise") & 0x7FFFFFFF
-                rng_rel = np.random.default_rng(int(seed_rel))
-
-                yrel = synth_release_tail(
-                    mip_low, mip_mid, mip_high,
-                    f0_base=f0_base,
-                    sr=int(sr),
-                    n=n_rel,
-                    v=v,
-                    base_pos=base_pos,
-                    base_mip=base_mip,
-                    note_keytrack=kt,
-                    note_name=note,
-                    vel_index=vel_index,
-                    rr_index=rri,
-                    rng_noise=rng_rel,
-                    phase0_low=ph_end0,
-                    phase0_mid=ph_end1,
-                    phase0_high=ph_end2,
-                    mip_block=int(mip_block),
-                    mip_smooth_tau=float(mip_smooth_tau),
-                )
-
-                if bits is not None:
-                    yrel = add_tpdf_dither(yrel, bits=bits, rng=rng_rel)
-
-                fnr = f"SYN_{safe_name(note)}_VEL{vel_midi:03d}_RR{rri:02d}_REL.wav"
-                out_path_r = os.path.join(note_dir, fnr)
-                sf.write(out_path_r, yrel, int(sr), subtype=bitdepth)
-                log(f"Wrote {out_path_r}")
-
-                done += 1
-                if progress_fn:
-                    progress_fn(done, total)
 
     if progress_fn:
         progress_fn(total, total)
@@ -965,11 +955,12 @@ def launch_gui():
             self.velocity.setValue(100)
             grid.addWidget(self.velocity, 5, 1)
 
-            # round robins
+            # round robins (fijo a 1)
             grid.addWidget(QLabel("Round Robins (RR):"), 6, 0)
             self.rr = QSpinBox()
-            self.rr.setRange(1, 8)
-            self.rr.setValue(3)
+            self.rr.setRange(1, 1)
+            self.rr.setValue(1)
+            self.rr.setEnabled(False)
             grid.addWidget(self.rr, 6, 1)
 
             # bitdepth
@@ -979,12 +970,13 @@ def launch_gui():
             self.bitdepth.setCurrentText("FLOAT")
             grid.addWidget(self.bitdepth, 7, 1)
 
-            # release_time
+            # release_time (fijo off)
             grid.addWidget(QLabel("Release time (s) (0 = off):"), 8, 0)
             self.release_time = QDoubleSpinBox()
             self.release_time.setDecimals(2)
             self.release_time.setRange(0.0, 20.0)
             self.release_time.setValue(0.0)
+            self.release_time.setEnabled(False)
             grid.addWidget(self.release_time, 8, 1)
 
             # loop start/end/xfade
@@ -1006,9 +998,9 @@ def launch_gui():
             wrow2 = QWidget(); wrow2.setLayout(row2)
             grid.addWidget(wrow2, 10, 1)
 
-            # fixed tones C-2..C8 (still shown)
+            # fixed tones label
             grid.addWidget(QLabel("Roots (fixed):"), 11, 0)
-            roots_lbl = QLabel("C-2 .. C8 (11 tones)")
+            roots_lbl = QLabel("C-2, F#-2 .. C8, F#8 (22 tones)")
             roots_lbl.setStyleSheet("opacity: 0.85;")
             grid.addWidget(roots_lbl, 11, 1)
 
