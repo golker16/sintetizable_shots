@@ -284,11 +284,25 @@ def _lerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
 
 
 def _table_read_linear(table_1d: np.ndarray, phase: np.ndarray) -> np.ndarray:
-    n = len(table_1d)
-    idx = phase * n
+    """Lectura wavetable con interpolación lineal y wrap seguro (evita idx==n)."""
+    table_1d = np.asarray(table_1d, dtype=np.float32)
+    phase = np.asarray(phase, dtype=np.float32)
+
+    n = int(len(table_1d))
+    if n <= 1:
+        return np.zeros_like(phase, dtype=np.float32)
+
+    # Wrap fase robusto: garantiza 0 <= phase < 1 incluso con errores numéricos.
+    phase = np.mod(phase, 1.0).astype(np.float32, copy=False)
+
+    idx = phase * float(n)  # 0..n
     i0 = np.floor(idx).astype(np.int32)
     frac = (idx - i0).astype(np.float32)
+
+    # Si idx cae exactamente en n por redondeo, mod lo corrige.
+    i0 = np.mod(i0, n)
     i1 = (i0 + 1) % n
+
     return (1.0 - frac) * table_1d[i0] + frac * table_1d[i1]
 
 
@@ -1551,3 +1565,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
